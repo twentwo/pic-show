@@ -1,0 +1,20 @@
+{
+  "name": "picshow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PicShow —— Tauri 2 沉浸式跨平台照片查看器",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icons": "python3 tools/make_icons.py",
+    "test": "node tools/test_geometry.mjs",
+    "test:methods": "node tools/check_methods.mjs",
+    "rust:check": "cd src-tauri && cargo check",
+    "rust:test": "cd src-tauri && cargo test",
+    "check": "npm run rust:check && npm test && npm run test:methods"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

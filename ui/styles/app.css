@@ -1,0 +1,609 @@
+/* ==========================================================================
+   PicShow —— 深色沉浸式照片查看器
+   ========================================================================== */
+
+:root {
+  --bg: #0b0b0d;
+  --surface: #14151a;
+  --surface-2: #1d1f27;
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #e9ebf0;
+  --text-dim: #939aa8;
+  --accent: #4c8dff;
+  --radius: 8px;
+  --topbar-h: 52px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+/* --------------------------------------------------------------------------
+   顶栏
+   -------------------------------------------------------------------------- */
+
+.topbar {
+  position: relative;
+  z-index: 10;
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: none;
+}
+
+.logo {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: linear-gradient(135deg, #ffd166 0%, #4c8dff 55%, #7a5cff 100%);
+}
+
+.appname {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.topbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* 顶栏上的可拖拽空白区（内部绝不能放交互元素） */
+.topbar-drag {
+  flex: 1 1 auto;
+  align-self: stretch;
+  min-width: 12px;
+}
+
+.topbar-status {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cache-text {
+  flex: none;
+  opacity: 0.72;
+  font-size: 12px;
+}
+
+.btn {
+  height: 30px;
+  padding: 0 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.08s ease;
+}
+
+.btn:hover {
+  background: #272a34;
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+/* 浏览器里打开开发服务器时禁用，省得点出一堆看不懂的报错 */
+.btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.btn:disabled:hover {
+  background: var(--surface-2);
+}
+
+.btn:disabled:active {
+  transform: none;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 500;
+}
+
+.btn-primary:hover {
+  background: #3d7df0;
+}
+
+/* --------------------------------------------------------------------------
+   网格（虚拟化 + justified 等高行）
+   -------------------------------------------------------------------------- */
+
+.grid {
+  position: absolute;
+  inset: var(--topbar-h) 0 0 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  outline: none;
+  overscroll-behavior: contain;
+  will-change: scroll-position;
+}
+
+.grid::-webkit-scrollbar {
+  width: 10px;
+}
+
+.grid::-webkit-scrollbar-thumb {
+  background: #2a2d36;
+  border-radius: 6px;
+  border: 2px solid var(--bg);
+}
+
+.grid-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.cell {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--surface-2);
+  cursor: zoom-in;
+  contain: strict;
+  transition: box-shadow 0.18s ease;
+}
+
+.cell:hover {
+  box-shadow: 0 0 0 2px rgba(76, 141, 255, 0.75);
+  z-index: 1;
+}
+
+/* 24px 占位图放大后做模糊：滚动时先糊后清，不会出现空白格子 */
+.cell-ph {
+  position: absolute;
+  inset: -10%;
+  background-size: cover;
+  background-position: center;
+  filter: blur(12px) saturate(1.15);
+  opacity: 1;
+  transition: opacity 0.4s ease;
+}
+
+.cell.is-loaded .cell-ph {
+  opacity: 0;
+}
+
+.cell-thumb {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+
+.cell.is-loaded .cell-thumb {
+  opacity: 1;
+}
+
+.cell.is-failed::after {
+  content: "无法加载";
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+/* 展开/收起动画期间隐藏来源缩略图，避免两张图重影 */
+.cell.is-origin-hidden {
+  opacity: 0 !important;
+}
+
+/* --------------------------------------------------------------------------
+   空状态 / 拖放提示
+   -------------------------------------------------------------------------- */
+
+.empty {
+  position: absolute;
+  inset: var(--topbar-h) 0 0 0;
+  display: none;
+  place-items: center;
+  padding: 24px;
+}
+
+.empty.is-visible {
+  display: grid;
+}
+
+.empty-inner {
+  text-align: center;
+  max-width: 430px;
+}
+
+.empty-icon {
+  width: 64px;
+  height: 64px;
+  fill: none;
+  stroke: var(--text-dim);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.7;
+}
+
+.empty h1 {
+  font-size: 19px;
+  font-weight: 600;
+  margin: 14px 0 4px;
+}
+
+.empty p {
+  color: var(--text-dim);
+  margin: 0 0 16px;
+}
+
+.empty-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+.shortcuts {
+  margin: 26px 0 0;
+  display: grid;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.shortcuts > div {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+.shortcuts dt {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.shortcuts dd {
+  margin: 0;
+}
+
+/* 拖入文件时的全窗口提示 */
+body.is-dragging::after {
+  content: "松开以打开";
+  position: fixed;
+  inset: 12px;
+  z-index: 300;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: 14px;
+  background: rgba(76, 141, 255, 0.08);
+  color: var(--accent);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+
+/* --------------------------------------------------------------------------
+   全屏查看器
+   -------------------------------------------------------------------------- */
+
+.viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  overflow: hidden;
+  background: #000;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.viewer[hidden] {
+  display: none;
+}
+
+.viewer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: #000;
+  opacity: 1;
+}
+
+/* stage 铺满全屏只为居中，必须让点击穿透到背景层，
+   否则「点图片外关闭」永远不会触发 */
+.viewer-stage {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.slide {
+  position: relative;
+  transform: translate3d(0, 0, 0) scale(1);
+  will-change: transform;
+  cursor: zoom-in;
+  pointer-events: auto;
+}
+
+.slide.is-zoomed {
+  cursor: grab;
+}
+
+.slide.is-grabbing {
+  cursor: grabbing;
+}
+
+.slide img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+
+/* 原图到位后淡入，盖住低分辨率底图 */
+.slide-full {
+  opacity: 0;
+  transition: opacity 0.32s ease;
+}
+
+.slide.is-full .slide-full,
+.slide.is-static .slide-full {
+  opacity: 1;
+}
+
+/* --------------------------------------------------------------------------
+   Chrome：自动淡出的控件层
+   -------------------------------------------------------------------------- */
+
+.viewer-chrome {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.viewer-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 54px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0));
+  transition: opacity 0.3s ease;
+  pointer-events: auto;
+}
+
+.viewer-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.viewer-title {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-counter {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.viewer-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.13);
+}
+
+.icon-btn svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.viewer-zoom {
+  min-width: 58px;
+  height: 28px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+
+.nav-btn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  cursor: pointer;
+  transition: opacity 0.3s ease, background 0.15s ease;
+  pointer-events: auto;
+}
+
+.nav-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.nav-btn svg {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  stroke: #fff;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.nav-btn.prev {
+  left: 18px;
+}
+
+.nav-btn.next {
+  right: 18px;
+}
+
+/* 空闲后隐藏控件与光标，只留图片 */
+.viewer.is-idle .viewer-bar,
+.viewer.is-idle .nav-btn {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.viewer.is-idle .slide {
+  cursor: none;
+}
+
+/* --------------------------------------------------------------------------
+   宿主环境提示（仅浏览器模式可见）
+   -------------------------------------------------------------------------- */
+
+.host-warning {
+  position: fixed;
+  left: 50%;
+  top: 72px;
+  z-index: 500;
+  transform: translateX(-50%);
+  max-width: min(620px, calc(100vw - 32px));
+  padding: 12px 18px;
+  border-radius: 11px;
+  border: 1px solid rgba(255, 196, 66, 0.38);
+  background: rgba(52, 40, 10, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  color: #ffd166;
+  font-size: 12.5px;
+  line-height: 1.75;
+  text-align: center;
+}
+
+.host-warning[hidden] {
+  display: none;
+}
+
+.host-warning code {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(255, 209, 102, 0.16);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+/* --------------------------------------------------------------------------
+   Toast
+   -------------------------------------------------------------------------- */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 32px;
+  z-index: 400;
+  transform: translateX(-50%) translateY(8px);
+  padding: 9px 16px;
+  border-radius: 9px;
+  background: rgba(28, 30, 37, 0.96);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transition: opacity 0.22s ease, transform 0.22s var(--ease);
+  pointer-events: none;
+}
+
+.toast.is-visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.toast[hidden] {
+  display: none;
+}

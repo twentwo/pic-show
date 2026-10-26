@@ -1,0 +1,14 @@
+# 前端：本项目无构建步骤，无需忽略产物
+node_modules/
+
+# Rust
+src-tauri/target/
+src-tauri/gen/
+
+# 运行时缓存
+src-tauri/thumbs/
+
+# 系统
+.DS_Store
+Thumbs.db
+*.log

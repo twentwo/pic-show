@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PicShow</title>
+    <link rel="stylesheet" href="./styles/app.css" />
+  </head>
+  <body>
+    <!-- ===================== 网格模式 ===================== -->
+    <header class="topbar">
+      <div class="brand" data-tauri-drag-region>
+        <span class="logo"></span>
+        <span class="appname">PicShow</span>
+      </div>
+
+      <div class="topbar-actions">
+        <button id="btn-open-files" class="btn" type="button">打开图片…</button>
+        <button id="btn-open-folder" class="btn btn-primary" type="button">
+          打开文件夹…
+        </button>
+      </div>
+
+      <!--
+        可拖拽的空白区。
+
+        注意：绝对不要把按钮放进 `data-tauri-drag-region` 元素内部。
+        Tauri 会在该区域的 mousedown 上接管事件用于拖动窗口，
+        导致子元素的 click 事件根本不会触发——表现就是「按钮点了没反应」。
+      -->
+      <div class="topbar-drag" data-tauri-drag-region></div>
+
+      <div class="topbar-status">
+        <span id="status-text">未打开任何图片</span>
+        <span id="cache-text" class="cache-text"></span>
+      </div>
+    </header>
+
+    <main id="grid" class="grid" tabindex="0">
+      <div id="grid-spacer" class="grid-spacer"></div>
+    </main>
+
+    <section id="empty" class="empty is-visible">
+      <div class="empty-inner">
+        <svg class="empty-icon" viewBox="0 0 64 64" aria-hidden="true">
+          <rect x="6" y="12" width="52" height="40" rx="5" />
+          <circle cx="22" cy="27" r="5" />
+          <path d="M10 46 L26 30 L38 42 L46 34 L54 44" />
+        </svg>
+
+        <h1>PicShow</h1>
+        <p>把图片或文件夹拖到这里，或者直接选择</p>
+
+        <div class="empty-actions">
+          <button id="btn-empty-files" class="btn" type="button">选择图片</button>
+          <button id="btn-empty-folder" class="btn btn-primary" type="button">
+            选择文件夹
+          </button>
+        </div>
+
+        <dl class="shortcuts">
+          <div><dt>滚轮 / 双击</dt><dd>连续缩放</dd></div>
+          <div><dt>拖拽</dt><dd>平移，越界自动回弹</dd></div>
+          <div><dt>下拉</dt><dd>跟手缩小，松手关闭</dd></div>
+          <div><dt>← →</dt><dd>上一张 / 下一张</dd></div>
+          <div><dt>Esc</dt><dd>返回网格</dd></div>
+          <div><dt>0 / + -</dt><dd>适应窗口 / 缩放</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <!-- ===================== 全屏查看器 ===================== -->
+    <div id="viewer" class="viewer" hidden>
+      <div class="viewer-backdrop"></div>
+      <div class="viewer-stage"></div>
+
+      <div class="viewer-chrome">
+        <div class="viewer-bar">
+          <button class="icon-btn viewer-close" type="button" title="关闭 (Esc)" aria-label="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6 L18 18 M18 6 L6 18" /></svg>
+          </button>
+
+          <div class="viewer-meta">
+            <span id="viewer-title" class="viewer-title"></span>
+            <span id="viewer-counter" class="viewer-counter"></span>
+          </div>
+
+          <div class="viewer-tools">
+            <button class="icon-btn zoom-out" type="button" title="缩小 (-)" aria-label="缩小">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" /></svg>
+            </button>
+            <button id="viewer-zoom" class="viewer-zoom" type="button" title="适应窗口 (0)">100%</button>
+            <button class="icon-btn zoom-in" type="button" title="放大 (+)" aria-label="放大">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v12M6 12h12" /></svg>
+            </button>
+            <button class="icon-btn reveal" type="button" title="在文件管理器中显示" aria-label="在文件管理器中显示">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h5l2 2h9v10H4z" /></svg>
+            </button>
+          </div>
+        </div>
+
+        <button class="nav-btn prev" type="button" title="上一张 (←)" aria-label="上一张">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5 L8 12 L15 19" /></svg>
+        </button>
+        <button class="nav-btn next" type="button" title="下一张 (→)" aria-label="下一张">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5 L16 12 L9 19" /></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- 仅在「用普通浏览器打开开发服务器」时出现 -->
+    <div id="host-warning" class="host-warning" hidden>
+      <b>这里不是 PicShow 的运行环境。</b><br />
+      <code>localhost:1420</code> 是 Tauri 内部加载前端用的开发服务器，
+      在普通浏览器里没有后端注入，所有命令都不可用。<br />
+      请运行 <code>npm run dev</code>，并在弹出的<b>桌面窗口</b>中使用。
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <script type="module" src="./js/main.js"></script>
+  </body>
+</html>
