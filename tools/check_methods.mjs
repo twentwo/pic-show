@@ -30,6 +30,8 @@ const OPTION_CALLBACKS = new Set([
 const RE_DEFINED = /^ {2}(?:async\s+|get\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/gm;
 /** 顶层函数：`function name(` */
 const RE_TOP_FN = /^function\s+([A-Za-z_$][\w$]*)/gm;
+/** 构造器里通过选项传入的回调：`this.onJump = onJump;` */
+const RE_ASSIGNED = /this\.([A-Za-z_$][\w$]*)\s*=[^=]/g;
 /** 调用：`this.name(` */
 const RE_CALLED = /this\.([A-Za-z_$][\w$]*)\s*\(/g;
 /** 可选调用：`this.name?.(` */
@@ -47,7 +49,8 @@ let problems = 0;
 for (const [file, src] of sources) {
   const defined = new Set([
     ...[...src.matchAll(RE_DEFINED)].map((m) => m[1]),
-    ...[...src.matchAll(RE_TOP_FN)].map((m) => m[1])
+    ...[...src.matchAll(RE_TOP_FN)].map((m) => m[1]),
+    ...[...src.matchAll(RE_ASSIGNED)].map((m) => m[1])
   ]);
 
   const called = new Set([

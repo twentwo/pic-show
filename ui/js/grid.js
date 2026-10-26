@@ -52,13 +52,21 @@ export class Grid {
     this.totalHeight = 0;
     this._raf = 0;
     this._idleTimer = 0;
+    /** 上次布局用的容器尺寸；用来判断这次变化是否真的需要重排 */
+    this._w = 0;
+    this._h = 0;
+    /** 重排也走 rAF：连续拖窗口时一帧只算一次 */
+    this._layoutRaf = 0;
 
     this.root.addEventListener('scroll', () => this.schedule(), {
       passive: true
     });
 
-    this._ro = new ResizeObserver(() => this.relayout());
+    this._ro = new ResizeObserver(() => this.onResize());
     this._ro.observe(this.root);
+    // ResizeObserver 在个别 webview 上「最小化再还原」时不回调，用 window 事件兜底
+    this._onWinResize = () => this.onResize();
+    window.addEventListener('resize', this._onWinResize);
 
     this.root.addEventListener('click', (event) => {
       const cell = event.target?.closest?.('.cell');
@@ -76,15 +84,76 @@ export class Grid {
     this.relayout();
   }
 
-  relayout() {
+  /**
+   * 容器尺寸变化。
+   *
+   * 必须区分「宽度变」和「只是高度变」：
+   *   * 宽度变 —— 每行张数、行高全变了，要重排（O(n)）；
+   *   * 只高度变 —— 布局不变，只是可见行数变了，重新挂载即可。
+   *
+   * 尺寸为 0（窗口最小化、元素隐藏）一律跳过：那时算出来的是垃圾布局
+   * （每行一张、行高被拉满），用它去污染界面毫无意义；尺寸恢复时自然会
+   * 再回调一次，那时再算。
+   */
+  onResize() {
+    const w = this.root.clientWidth;
+    const h = this.root.clientHeight;
+    if (w <= 0 || h <= 0) return;
+
+    if (w === this._w) {
+      if (h === this._h) return;
+      this._h = h;
+      this.schedule();
+      return;
+    }
+
+    // 首次布局（_w 还是 0）不需要锚定，之后每次宽度变化都要锚定
+    const anchor = this._w > 0 && this.rows.length > 0;
+    this._w = w;
+    this._h = h;
+
+    // 先取消上一帧排的活再重排：
+    // 一是连续拖动时「最后一次尺寸」生效；
+    // 二是万一那次 rAF 被丢掉（页面隐藏 / 元素被移走），句柄会一直挂着，
+    //    若只用「有句柄就 return」的写法，之后的 resize 就再也不响应了。
+    if (this._layoutRaf) cancelAnimationFrame(this._layoutRaf);
+    this._layoutRaf = requestAnimationFrame(() => {
+      this._layoutRaf = 0;
+      this.relayout({ anchor });
+    });
+  }
+
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.anchor] 重排后保持「视口顶部那一项」的视觉位置。
+   *   窗口尺寸一变，行高就变，若不锚定，用户正看着的那排会被推到别处。
+   */
+  relayout({ anchor = false } = {}) {
+    const prevTop = this.root.scrollTop;
+    const anchorIndex = anchor ? this.topIndex(prevTop) : -1;
+    const anchorRow = anchorIndex >= 0 ? this.rows[this.rowOf[anchorIndex]] : null;
+    // 该项距视口顶部的距离，重排后要原样保持
+    const anchorShift = anchorRow ? prevTop - anchorRow.y : 0;
+
+    this._w = this.root.clientWidth || this._w;
+    this._h = this.root.clientHeight || this._h;
     this.computeRows();
     this.spacer.style.height = `${this.totalHeight}px`;
+
+    if (anchorIndex >= 0) {
+      const row = this.rows[this.rowOf[anchorIndex]];
+      if (row) this.root.scrollTop = Math.max(0, row.y + anchorShift);
+    }
+
     this.update();
   }
 
   /** 贪心分行的 justified 布局。 */
   computeRows() {
-    const contentW = Math.max(80, this.root.clientWidth - PAD * 2);
+    const contentW = Math.max(80, (this.root.clientWidth || this._w) - PAD * 2);
+    // 目标行高跟着容器走：宽屏保持 210 的观感，窄屏自动降下来，
+    // 于是手机上每行 2~3 张、桌面上 6~8 张，不用写两套布局。
+    const targetH = clamp(contentW / 4, MIN_ROW_H, TARGET_ROW_H);
     const total = this.items.length;
 
     this.rows = [];
@@ -102,7 +171,7 @@ export class Grid {
         const nextCount = count + 1;
         const projected = (contentW - GAP * (nextCount - 1)) / nextSum;
         // 再加一张就会让行高低于目标 —— 收手，让这一行保持「够高」
-        if (count > 0 && projected < TARGET_ROW_H) break;
+        if (count > 0 && projected < targetH) break;
         sum = nextSum;
         count = nextCount;
         i += 1;
@@ -154,20 +223,7 @@ export class Grid {
 
     const top = this.root.scrollTop;
     const bottom = top + this.root.clientHeight;
-
-    // 二分：第一个「底边仍在视口下方」的行
-    let lo = 0;
-    let hi = rows.length - 1;
-    let first = rows.length;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (rows[mid].y + rows[mid].h >= top) {
-        first = mid;
-        hi = mid - 1;
-      } else {
-        lo = mid + 1;
-      }
-    }
+    const first = this.rowIndexAt(top);
 
     let last = first;
     while (last + 1 < rows.length && rows[last + 1].y <= bottom) last += 1;
@@ -187,22 +243,70 @@ export class Grid {
       }
     }
     for (const index of needed) {
-      if (!this.mounted.has(index)) this.mount(index);
+      const existing = this.mounted.get(index);
+      // 关键：重排之后**已挂载**的格子也必须重新写一遍几何。
+      // 只给新挂载的写几何的话，视口里那一屏会一直留着旧宽度/旧位置的
+      // inline style（只有滚出去再滚回来、经池子复用才会更新），
+      // 表现就是改完窗口大小后缩略图重叠、留白、溢出容器。
+      if (existing) this.refresh(index, existing);
+      else this.mount(index);
     }
   }
 
-  mount(index) {
-    const rowIndex = this.rowOf[index];
-    if (rowIndex == null || rowIndex < 0) return;
-    const row = this.rows[rowIndex];
-    const cell = row.cells.find((c) => c.index === index);
-    if (!cell) return;
+  /** 二分：第一个「底边仍在 y 下方」的行 */
+  rowIndexAt(y) {
+    const rows = this.rows;
+    let lo = 0;
+    let hi = rows.length - 1;
+    let ans = Math.max(0, rows.length - 1);
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (rows[mid].y + rows[mid].h >= y) {
+        ans = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return ans;
+  }
 
-    const el = this.pool.pop() ?? this.createCell();
-    el.dataset.index = String(index);
+  /** 视口顶部那一项，用作重排锚点 */
+  topIndex(scrollTop = this.root.scrollTop) {
+    if (!this.rows.length) return -1;
+    const row = this.rows[this.rowIndexAt(scrollTop)];
+    return row?.cells[0]?.index ?? -1;
+  }
+
+  cellOf(index) {
+    const rowIndex = this.rowOf[index];
+    if (rowIndex == null || rowIndex < 0) return null;
+    const row = this.rows[rowIndex];
+    if (!row) return null;
+    return { row, cell: row.cells.find((c) => c.index === index) ?? null };
+  }
+
+  /** 只重新写几何，不动缩略图请求 —— 重排时不能让已加载的图片闪一下 */
+  refresh(index, el) {
+    const found = this.cellOf(index);
+    if (!found?.cell) return;
+    this.place(el, found.cell, found.row);
+  }
+
+  place(el, cell, row) {
     el.style.width = `${cell.w}px`;
     el.style.height = `${cell.h}px`;
     el.style.transform = `translate3d(${cell.x}px, ${row.y}px, 0)`;
+  }
+
+  mount(index) {
+    const found = this.cellOf(index);
+    if (!found?.cell) return;
+    const { row, cell } = found;
+
+    const el = this.pool.pop() ?? this.createCell();
+    el.dataset.index = String(index);
+    this.place(el, cell, row);
     el.classList.add('is-pending');
     el.classList.remove('is-loaded', 'is-failed');
 
@@ -270,11 +374,9 @@ export class Grid {
     const el = this.mounted.get(index);
     if (el) return el.getBoundingClientRect();
 
-    const rowIndex = this.rowOf[index];
-    if (rowIndex == null || rowIndex < 0) return null;
-    const row = this.rows[rowIndex];
-    const cell = row.cells.find((c) => c.index === index);
-    if (!cell) return null;
+    const found = this.cellOf(index);
+    if (!found?.cell) return null;
+    const { row, cell } = found;
 
     const host = this.root.getBoundingClientRect();
     const left = host.left + cell.x;
@@ -293,10 +395,10 @@ export class Grid {
 
   /** 滚动到指定图片并同步完成挂载，供关闭动画取落点矩形。 */
   ensureVisible(index) {
-    const rowIndex = this.rowOf[index];
-    if (rowIndex == null || rowIndex < 0) return;
+    const found = this.cellOf(index);
+    if (!found) return;
+    const row = found.row;
 
-    const row = this.rows[rowIndex];
     const top = this.root.scrollTop;
     const vh = this.root.clientHeight;
     let next = top;

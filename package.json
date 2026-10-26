@@ -10,9 +10,11 @@
     "icons": "python3 tools/make_icons.py",
     "test": "node tools/test_geometry.mjs",
     "test:methods": "node tools/check_methods.mjs",
+    "test:tokens": "node tools/check_tokens.mjs",
     "rust:check": "cd src-tauri && cargo check",
     "rust:test": "cd src-tauri && cargo test",
-    "check": "npm run rust:check && npm test && npm run test:methods"
+    "check": "npm run rust:check && npm test && npm run test:methods && npm run test:tokens",
+    "probe": "node tools/probe_gallery.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

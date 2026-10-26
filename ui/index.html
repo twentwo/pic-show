@@ -4,6 +4,40 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PicShow</title>
+
+    <!--
+      主题必须在**样式表之前**定下来 —— 这是「加载时闪一下浅色」的唯一解药。
+
+      浏览器拿到 HTML 之后，样式表一到位就会按当时的 `data-theme` 画第一帧。
+      如果把这个决定推迟到 JS 模块加载完（哪怕是首屏脚本），中间那一帧就是
+      系统默认色：深色主题的用户会看到一次白闪。
+
+      所以这里是**同步内联**脚本，不 defer、不 module、不 import、不 await：
+      它在 CSS 之前跑完，第一帧就带着正确的 `data-theme`。
+
+      两处细节：
+        * 底色也临时写在 `<html>` 上 —— 连 CSS 都还没到的那几十毫秒里，
+          浏览器给的是自己的默认白底，只有这一个办法能压住；
+          ui/js/theme.js 启动后会把它摘掉，交还给 CSS。
+        * 这两个十六进制必须和 CSS 令牌里的 `--bg` 同值：
+          check_tokens.mjs 会比对，改了一半就报错。
+    -->
+    <script>
+      (function () {
+        var pref = 'dark';
+        try {
+          var saved = localStorage.getItem('picshow.theme');
+          if (saved === 'light' || saved === 'dark') pref = saved;
+        } catch (e) {
+          /* 存储不可用就用默认深色 */
+        }
+        var root = document.documentElement;
+        root.dataset.theme = pref;
+        root.style.colorScheme = pref;
+        root.style.backgroundColor = pref === 'light' ? '#f4f5f7' : '#0b0b0d';
+      })();
+    </script>
+
     <link rel="stylesheet" href="./styles/app.css" />
   </head>
   <body>
@@ -18,6 +52,23 @@
         <button id="btn-open-files" class="btn" type="button">打开图片…</button>
         <button id="btn-open-folder" class="btn btn-primary" type="button">
           打开文件夹…
+        </button>
+        <button
+          id="btn-theme"
+          class="icon-btn theme-toggle"
+          type="button"
+          title="切换到浅色主题"
+          aria-label="切换到浅色主题"
+        >
+          <svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="4.2" />
+            <path
+              d="M12 2.6v2.4M12 19v2.4M2.6 12h2.4M19 12h2.4M5.4 5.4l1.7 1.7M16.9 16.9l1.7 1.7M18.6 5.4l-1.7 1.7M7.1 16.9l-1.7 1.7"
+            />
+          </svg>
+          <svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20.2 14.6A8.6 8.6 0 0 1 9.4 3.8a7.3 7.3 0 1 0 10.8 10.8z" />
+          </svg>
         </button>
       </div>
 
@@ -61,8 +112,11 @@
         <dl class="shortcuts">
           <div><dt>滚轮 / 双击</dt><dd>连续缩放</dd></div>
           <div><dt>拖拽</dt><dd>平移，越界自动回弹</dd></div>
+          <div><dt>左右滑动</dt><dd>上一张 / 下一张（触屏可跟手拖动）</dd></div>
           <div><dt>下拉</dt><dd>跟手缩小，松手关闭</dd></div>
           <div><dt>← →</dt><dd>上一张 / 下一张</dd></div>
+          <div><dt>Home / End</dt><dd>第一张 / 最后一张</dd></div>
+          <div><dt>底部胶片条</dt><dd>按缩略图直接跳转</dd></div>
           <div><dt>Esc</dt><dd>返回网格</dd></div>
           <div><dt>0 / + -</dt><dd>适应窗口 / 缩放</dd></div>
         </dl>
@@ -75,7 +129,12 @@
       <div class="viewer-stage"></div>
 
       <div class="viewer-chrome">
-        <div class="viewer-bar">
+        <!--
+          标题栏。沉浸式预览下窗口装饰被关掉，这就是屏幕上唯一的标题栏：
+          左边关闭、中间文件名与序号、右边工具，空白处可拖动窗口。
+          它的显隐与下面「上一张/下一张」按钮、底部胶片条共用同一套计时。
+        -->
+        <div id="viewer-bar" class="viewer-bar">
           <button class="icon-btn viewer-close" type="button" title="关闭 (Esc)" aria-label="关闭">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6 L18 18 M18 6 L6 18" /></svg>
           </button>
@@ -84,6 +143,8 @@
             <span id="viewer-title" class="viewer-title"></span>
             <span id="viewer-counter" class="viewer-counter"></span>
           </div>
+
+          <div class="viewer-drag" data-tauri-drag-region></div>
 
           <div class="viewer-tools">
             <button class="icon-btn zoom-out" type="button" title="缩小 (-)" aria-label="缩小">
@@ -96,6 +157,24 @@
             <button class="icon-btn reveal" type="button" title="在文件管理器中显示" aria-label="在文件管理器中显示">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h5l2 2h9v10H4z" /></svg>
             </button>
+            <!-- 沉浸式预览下顶栏是隐藏的，所以主题开关必须在预览界面里也有一份 -->
+            <button
+              id="btn-theme-viewer"
+              class="icon-btn theme-toggle"
+              type="button"
+              title="切换到浅色主题"
+              aria-label="切换到浅色主题"
+            >
+              <svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="4.2" />
+                <path
+                  d="M12 2.6v2.4M12 19v2.4M2.6 12h2.4M19 12h2.4M5.4 5.4l1.7 1.7M16.9 16.9l1.7 1.7M18.6 5.4l-1.7 1.7M7.1 16.9l-1.7 1.7"
+                />
+              </svg>
+              <svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20.2 14.6A8.6 8.6 0 0 1 9.4 3.8a7.3 7.3 0 1 0 10.8 10.8z" />
+              </svg>
+            </button>
           </div>
         </div>
 
@@ -105,6 +184,11 @@
         <button class="nav-btn next" type="button" title="下一张 (→)" aria-label="下一张">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5 L16 12 L9 19" /></svg>
         </button>
+
+        <!-- 胶片条：缩略图列表，点击直接跳转 -->
+        <div id="viewer-strip" class="viewer-strip">
+          <div id="strip-inner" class="strip-inner"></div>
+        </div>
       </div>
     </div>
 

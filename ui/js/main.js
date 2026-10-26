@@ -5,6 +5,8 @@
 import * as api from './api.js';
 import { Grid } from './grid.js';
 import { Viewer } from './viewer.js';
+import { initTheme, mountThemeToggles } from './theme.js';
+import { launchOriginRect, launchWindowRect } from './launch.js';
 
 const el = (id) => document.getElementById(id);
 
@@ -56,7 +58,11 @@ const grid = new Grid({
 const viewer = new Viewer({
   root: dom.viewer,
   grid,
-  onError: (message) => toast(message)
+  onError: (message) => toast(message),
+  // 沉浸式预览（从文件管理器唤起）关闭后直接退出，回到文件管理器
+  onExit: () => {
+    api.exitApp().catch(() => window.close());
+  }
 });
 
 /* ------------------------------------------------------------------ *
@@ -98,6 +104,64 @@ function load(payload) {
 api.onItems(load).catch((error) => toast(String(error)));
 
 /* ------------------------------------------------------------------ *
+ * 从文件管理器打开（右键 → 打开方式 → PicShow）
+ *
+ * 这条路径的语义与「先开 PicShow 再选图」完全不同：
+ *   * 不显示浏览器界面（顶栏 / 网格 / 空状态全部让位），直接进全屏预览；
+ *   * 关闭即退出应用 —— 这个窗口本来就是为看这一张而存在的；
+ *   * 画廊集合是目标图片**所在目录**里的全部图片，按文件名排序。
+ * ------------------------------------------------------------------ */
+
+/** 事件通道是否已经送来过打开请求（避免与「待取件」重复打开一次） */
+let launchByEvent = false;
+
+/**
+ * 播放「从那一格长出来」的开场动画。
+ *
+ * 来源矩形来自后端记录的启动瞬间光标位置；拿不到就退化为屏幕中心 0.8 倍。
+ * 两个入口共用（冷启动的 boot、应用已在跑时的 Opened 事件），避免两处走着
+ * 走着又不一样。
+ */
+async function openLaunchView(payload) {
+  const origin = await api.launchOrigin().catch(() => null);
+  viewer.openLaunch(payload.index ?? 0, launchOriginRect(origin));
+}
+
+async function enterImmersive(payload) {
+  const items = payload?.items ?? [];
+  if (!items.length) return;
+
+  document.body.classList.add('is-immersive');
+
+  // 应用已经在跑、用户又从 Finder 打开了另一张：先关掉旧的再开新的。
+  // 关之前必须临时摘掉「关闭即退出」，否则会在中途把应用整个退掉。
+  if (viewer.isOpen) {
+    viewer.setExitOnClose(false);
+    await viewer.close();
+  }
+
+  // 去掉系统绘制的原生标题栏（颜色/模糊跟预览面对不上，也不受空闲计时
+  // 控制）。页面里那条 viewer-bar 接管标题栏的角色：背景同源、显隐同步。
+  await api.setImmersiveChrome(true).catch(() => {});
+  // 等窗口形态变化后的尺寸落定，别按旧尺寸适配完又弹一下
+  await nextFrames(2);
+
+  grid.setItems(items);
+  viewer.setItems(items);
+  // 关闭 = 退出，回到文件管理器
+  viewer.setExitOnClose(true);
+  await openLaunchView(payload);
+
+  // 窗口标题由后端在装载时同步（set_title 走插件权限，前端调用容易静默失败）
+  refreshCacheStats({ delay: 300 });
+}
+
+api.onLaunch((payload) => {
+  launchByEvent = true;
+  enterImmersive(payload);
+}).catch((error) => toast(String(error)));
+
+/* ------------------------------------------------------------------ *
  * 工具栏 / 快捷键
  * ------------------------------------------------------------------ */
 
@@ -109,6 +173,9 @@ el('btn-open-files').addEventListener('click', () => pick('files'));
 el('btn-open-folder').addEventListener('click', () => pick('folder'));
 el('btn-empty-files').addEventListener('click', () => pick('files'));
 el('btn-empty-folder').addEventListener('click', () => pick('folder'));
+
+// 主题开关要挂两处：顶栏（浏览界面）与预览标题栏（沉浸式下只有后者够得着）
+mountThemeToggles([el('btn-theme'), el('btn-theme-viewer')]);
 
 window.addEventListener('keydown', (event) => {
   const meta = event.metaKey || event.ctrlKey;
@@ -197,5 +264,110 @@ function applyHostMode() {
 applyHostMode();
 dom.grid.focus();
 
-// 首屏已就绪 —— 让后端把窗口显示出来（隐藏启动，见 tauri.conf.json）。
-api.showWindow();
+/**
+ * 启动收尾。两条互不相干的路：
+ *
+ *   * 从文件管理器打开 —— 走 `bootLaunch()`：不建立主界面，窗口直接以沉浸式
+ *     全屏亮起并播放放大动画；
+ *   * 常规启动 —— 点亮主界面（网格 / 空状态），等用户的下一步操作。
+ *
+ * 只在**该走的那一分支**上显示窗口，是「一闪而过」的唯一解药：主界面一旦
+ * 被画出来，再隐藏就成了肉眼可见的闪。
+ */
+async function boot() {
+  // 真正的首帧主题是 index.html 头部那段同步脚本落的（比 CSS 还早，所以不会
+  // 闪）；这里补齐后半段：同步原生窗口、摘掉临时行内底色、刷新按钮文案。
+  initTheme();
+
+  let pending = null;
+  if (api.isTauri && !launchByEvent) {
+    pending = await api.takeLaunchTarget().catch(() => null);
+  }
+  if (pending?.items?.length) {
+    await bootLaunch(pending).catch((error) =>
+      api.logError(error?.stack || String(error))
+    );
+    return;
+  }
+
+  await api.showWindow();
+}
+
+/**
+ * 「右键 → 打开方式」的专属启动路径。
+ *
+ * 要解决的正是「窗口一闪而过」：以前的顺序是 showWindow → 等两帧 → 再切到
+ * 预览，中间那几帧主界面是实打实画出来的。所以这里把顺序反过来 ——
+ *
+ *   1. 先加 `is-immersive`（纯 CSS，不等任何 IPC）：主界面从此不可能被绘制；
+ *   2. 让后端趁窗口还藏着把形态与尺寸定好，**然后才点亮**（`prepareLaunchWindow`）；
+ *   3. 等布局确认已经长到目标大小 —— 这一步等的是**布局**，不是图片：几何来自
+ *      items 的宽高元数据，所以第一帧就有正确的起止位置；
+ *   4. 最后播放放大动画：从启动瞬间光标所在那一格（拿不到则从屏幕中心 0.8 倍）
+ *      FLIP 到全屏，并叠加透明度渐变。
+ */
+async function bootLaunch(payload) {
+  document.body.classList.add('is-immersive');
+
+  grid.setItems(payload.items);
+  viewer.setItems(payload.items);
+  viewer.setExitOnClose(true);
+
+  // 来源坐标这一问放在 promises 里**并行**跑出去，别把首帧拖住
+  const originPromise = api.launchOrigin();
+
+  await api
+    .prepareLaunchWindow(launchWindowRect())
+    .catch(() => api.showWindow());
+
+  // 等窗口真的长到目标尺寸再开画：maximize 的结果常常比 IPC 回执晚一到两帧，
+  // 而 FLIP 的起点是按**当前**可视区算的 —— 若按旧尺寸先算，动画就会从错误的
+  // 方向长出来。
+  const target = launchWindowRect();
+  await waitFor(
+    () =>
+      Math.abs(document.documentElement.clientWidth - target.width) <= 2 &&
+      Math.abs(document.documentElement.clientHeight - target.height) <= 2,
+    8
+  );
+
+  const origin = await originPromise.catch(() => null);
+  viewer.openLaunch(payload.index ?? 0, launchOriginRect(origin));
+  refreshCacheStats({ delay: 300 });
+}
+
+/**
+ * 等条件成立，最多等 `maxFrames` 帧。
+ *
+ * 为什么要有帧数上限：万一某个平台到了设置好的帧数还没回调那一帧，
+ * 宁可按旧尺寸先跑起来，也不能让用户盯着黑屏。
+ */
+const waitFor = (predicate, maxFrames = 8) =>
+  new Promise((resolve) => {
+    const step = (left) => {
+      if (predicate() || left <= 0) resolve();
+      else requestAnimationFrame(() => step(left - 1));
+    };
+    step(maxFrames);
+  });
+
+const nextFrames = (n) =>
+  new Promise((resolve) => {
+    const step = (left) =>
+      left <= 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+    step(n);
+  });
+
+// 兜住所有没被局部捕获的异常：webview 的 console 不进终端，
+// 没有这里就只剩「界面没反应」这类无从下手的报告。
+window.addEventListener('error', (event) => {
+  api.logError(event.error?.stack || event.message);
+});
+window.addEventListener('unhandledrejection', (event) => {
+  api.logError(event.reason?.stack || String(event.reason));
+});
+
+boot().catch((error) => {
+  api.logError(error?.stack || String(error));
+  api.showWindow();
+});

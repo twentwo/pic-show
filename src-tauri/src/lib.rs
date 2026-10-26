@@ -15,11 +15,13 @@ mod protocol;
 mod scanner;
 mod state;
 
+use std::path::PathBuf;
+
 use tauri::{Listener, Manager};
 use state::AppState;
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
@@ -29,9 +31,17 @@ pub fn run() {
             commands::pick_images,
             commands::open_folder,
             commands::open_paths,
+            commands::open_file_context,
+            commands::take_launch_target,
+            commands::launch_origin,
+            commands::prepare_launch_window,
             commands::reveal_image,
             commands::cache_stats,
+            commands::log_error,
             commands::window_ready,
+            commands::exit_app,
+            commands::set_immersive_chrome,
+            commands::set_window_theme,
         ])
         .setup(|app| {
             let data_dir = app
@@ -79,6 +89,28 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("启动 PicShow 失败");
+        .build(tauri::generate_context!())
+        .expect("构建 PicShow 失败");
+
+    // 「从文件管理器打开」的第一条通道：进程参数。
+    // Windows 关联打开、Linux .desktop 的 %F、以及命令行自测都走这里；
+    // macOS 不走（LaunchServices 不把文件放进 argv），由下面的 Opened 事件接管。
+    let argv = commands::argv_targets();
+    if !argv.is_empty() {
+        commands::deliver_launch(app.handle(), argv);
+    }
+
+    // 第二条通道：运行期事件。Finder 的「打开方式」在应用**已经运行**时
+    // 走的正是这条路（冷启动那次也走，只是那时还没有前端在听，靠 pending 补）。
+    app.run(|handle, event| {
+        if let tauri::RunEvent::Opened { urls } = event {
+            let paths: Vec<PathBuf> = urls
+                .iter()
+                .filter_map(|url| url.to_file_path().ok())
+                .collect();
+            if !paths.is_empty() {
+                commands::deliver_launch(handle, paths);
+            }
+        }
+    });
 }

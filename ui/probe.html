@@ -1,0 +1,1107 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>probe</title>
+    <link rel="stylesheet" href="./styles/app.css" />
+  </head>
+  <body>
+    <pre id="out">running</pre>
+    <script type="module">
+      const out = document.getElementById('out');
+      const log = [];
+      // 每断言一次就写回 DOM：万一后面卡住，也能看出卡在哪一步
+      const ok = (name, cond, extra = '') => {
+        log.push(`${cond ? 'PASS' : 'FAIL'} ${name}${extra ? ' :: ' + extra : ''}`);
+        out.textContent = log.join('\n');
+      };
+
+      // 用真实的 index.html 结构，避免探针与线上 DOM 分叉
+      const html = await (await fetch('./index.html')).text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      for (const node of [...doc.body.children]) {
+        if (node.tagName === 'SCRIPT') continue;
+        document.body.appendChild(node);
+      }
+
+      // 无头环境拿不到合成帧，Web Animations 永不 finished。
+      // 换成「立刻完成」的替身：动画的终值本来就是代码预写进 inline style 的，
+      // 所以状态与布局依然真实，只是省掉了 300ms 的过程。
+      // 顺带把**每次调用的参数**记下来 —— 15 节要靠它核对启动动画的起点、
+      // 时长与缓动（这些是 CSS 之外的部分，不看调用就断言不到）。
+      const animations = [];
+      Element.prototype.animate = function (keyframes, options) {
+        animations.push({ el: this, keyframes, options });
+        return { finished: Promise.resolve(), cancel() {}, finish() {} };
+      };
+      const clearAnimations = () => (animations.length = 0);
+      const lastOf = (el) => {
+        for (let i = animations.length - 1; i >= 0; i -= 1) {
+          if (animations[i].el === el) return animations[i];
+        }
+        return null;
+      };
+
+      try {
+      const { Grid } = await import('./js/grid.js');
+      const { Viewer, IDLE_MS, FADE_MS, FADE_EASE, OPEN_MS, OPEN_EASE } =
+        await import('./js/viewer.js');
+      const { applyTheme } = await import('./js/theme.js');
+      const theme = await import('./js/theme.js');
+
+      const items = Array.from({ length: 6 }, (_, i) => ({
+        id: `fake-${i}`,
+        name: `pic-${i}.jpg`,
+        width: 1600 + i * 100,
+        height: 900 + i * 40
+      }));
+
+      const grid = new Grid({
+        root: document.getElementById('grid'),
+        spacer: document.getElementById('grid-spacer'),
+        onActivate: (i, cell) => viewer.open(i, cell)
+      });
+      const viewer = new Viewer({ root: document.getElementById('viewer'), grid });
+
+      grid.setItems(items);
+      viewer.setItems(items);
+
+      const stage = viewer.stage;
+      // viewer 还是 hidden 时 clientWidth = 0，必须先打开再量
+      viewer.open(2, null);
+      const stageW = stage.clientWidth;
+      const centerOf = (el) => {
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      };
+      const stageCenter = () => {
+        const r = stage.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      };
+      const near = (a, b, tol = 2) => Math.abs(a - b) <= tol;
+      const indexes = () => viewer.slots.map((s) => s.__index);
+
+      /* ---------- 1. 打开 ---------- */
+      ok('打开后三个槽 = [1,2,3]', JSON.stringify(indexes()) === '[1,2,3]', indexes().join(','));
+      ok('基准偏移 = -1 屏', viewer.trackOffset === -stageW, String(viewer.trackOffset));
+      ok('计数器 = 3 / 6', viewer.counterEl.textContent === '3 / 6', viewer.counterEl.textContent);
+      ok('胶片条渲染出窗口', viewer.strip.mounted.size >= 6, String(viewer.strip.mounted.size));
+
+      const cur = viewer.currentSlot;
+      const img = cur.__low;
+      const c1 = centerOf(img);
+      const sc = stageCenter();
+      ok(
+        '当前图居中于 stage',
+        near(c1.x, sc.x) && near(c1.y, sc.y),
+        `img(${c1.x},${c1.y}) stage(${sc.x},${sc.y})`
+      );
+      ok(
+        '底图尺寸 = 适配尺寸',
+        near(img.getBoundingClientRect().width, viewer.box.w, 1),
+        `${img.getBoundingClientRect().width} vs ${viewer.box.w}`
+      );
+      ok(
+        '当前项在胶片条里高亮',
+        viewer.strip.mounted.get(2)?.classList.contains('is-current') === true
+      );
+
+      /* ---------- 2. 下一张（键盘路径） ---------- */
+      await viewer.go(1);
+      ok('切下一张后 index = 3', viewer.index === 3, String(viewer.index));
+      ok('轮转后槽位回到 [2,3,4]', JSON.stringify(indexes()) === '[2,3,4]', indexes().join(','));
+      ok('轮转后 slotIndex = 1', viewer.slotIndex === 1);
+      ok('轮转后基准偏移 = -1 屏', viewer.trackOffset === -stageW, String(viewer.trackOffset));
+      const c2 = centerOf(viewer.currentSlot.__low);
+      ok('切换后画面仍居中', near(c2.x, sc.x) && near(c2.y, sc.y), `(${c2.x},${c2.y})`);
+      ok('计数器 = 4 / 6', viewer.counterEl.textContent === '4 / 6', viewer.counterEl.textContent);
+
+      /* ---------- 3. 上一张 ---------- */
+      await viewer.go(-1);
+      ok('切上一张后 index = 2', viewer.index === 2, String(viewer.index));
+      ok('回退后槽位 = [1,2,3]', JSON.stringify(indexes()) === '[1,2,3]', indexes().join(','));
+      const c3 = centerOf(viewer.currentSlot.__low);
+      ok('回退后画面仍居中', near(c3.x, sc.x) && near(c3.y, sc.y), `(${c3.x},${c3.y})`);
+
+      /* ---------- 4. 单指横滑 ---------- */
+      const track = viewer.track;
+      const pd = (type, x, y, id = 1) => {
+        const ev = new PointerEvent(type, {
+          pointerId: id,
+          clientX: x,
+          clientY: y,
+          bubbles: true,
+          cancelable: true,
+          isPrimary: true
+        });
+        (type === 'pointerdown' ? track : window).dispatchEvent(ev);
+      };
+      const startX = Math.round(stageW / 2);
+      const startY = Math.round(stage.clientHeight / 2);
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      // 真实的触摸是「一串间隔十几毫秒的小位移」，而不是一帧跳到底
+      const drag = async (id, stepPx, steps, stepMs) => {
+        pd('pointerdown', startX, startY, id);
+        let x = startX;
+        for (let i = 0; i < steps; i += 1) {
+          await sleep(stepMs);
+          x += stepPx;
+          pd('pointermove', x, startY, id);
+        }
+        pd('pointerup', x, startY, id);
+        await sleep(400);
+      };
+
+      // 快划：每步 65px / 16ms → 速度约 4px/ms，远超阈值
+      pd('pointerdown', startX, startY, 1);
+      for (let i = 1; i <= 4; i += 1) {
+        await sleep(16);
+        pd('pointermove', startX - i * 65, startY, 1);
+      }
+      ok('横滑进入 swipe 模式', viewer.g.mode === 'swipe', String(viewer.g.mode));
+      ok('横滑跟手位移', Math.abs(viewer.g.swipeX + 260) < 6, String(viewer.g.swipeX));
+      pd('pointerup', startX - 260, startY, 1);
+      await sleep(500);
+      ok('松手后切到下一张', viewer.index === 3, String(viewer.index));
+      ok('滑动后画面居中', near(centerOf(viewer.currentSlot.__low).x, sc.x));
+
+      /* ---------- 5. 慢速小幅拖动应回弹 ---------- */
+      await drag(2, -8, 3, 30);
+      ok('小幅慢拖不切换', viewer.index === 3, String(viewer.index));
+      ok('小幅慢拖后回弹归零', Math.abs(viewer.g.swipeX) < 0.01, String(viewer.g.swipeX));
+      ok('回弹后画面仍居中', near(centerOf(viewer.currentSlot.__low).x, sc.x));
+
+      /* ---------- 6. 胶片条跳转 ---------- */
+      viewer.jumpTo(5);
+      await new Promise((r) => setTimeout(r, 400));
+      ok('跳转到第 6 张', viewer.index === 5, String(viewer.index));
+      ok('跳转后槽位 = [4,5,-1]', JSON.stringify(indexes()) === '[4,5,-1]', indexes().join(','));
+      ok('计数器 = 6 / 6', viewer.counterEl.textContent === '6 / 6', viewer.counterEl.textContent);
+
+      /* ---------- 7. 到头时的回弹 ---------- */
+      await viewer.go(1);
+      ok('最后一张再下一张不动', viewer.index === 5, String(viewer.index));
+
+      /* ---------- 7.5 响应式/布局 ---------- */
+      const compact = window.innerWidth <= 720;
+      ok(
+        '胶片条尺寸随断点切换',
+        viewer.strip.metrics.itemW === (compact ? 54 : 78),
+        String(viewer.strip.metrics.itemW)
+      );
+      const stripH = compact ? 72 : 96;
+      // 顶部还要让出标题栏那一条（图片不能被标题栏压住，显隐也不能引起跳动）
+      const chromeTop = compact ? 50 : 54;
+      ok(
+        'stage 高度让出了胶片条与标题栏',
+        Math.abs(stage.clientHeight - (window.innerHeight - stripH - chromeTop)) <= 1,
+        `${stage.clientHeight} / ${window.innerHeight} - ${stripH} - ${chromeTop}`
+      );
+      ok(
+        '胶片条自身高度正确',
+        Math.abs(viewer.strip.root.clientHeight - stripH) <= 1,
+        String(viewer.strip.root.clientHeight)
+      );
+
+      /* ---------- 7.6 滚轮缩放 ---------- */
+      viewer.track.dispatchEvent(
+        new WheelEvent('wheel', {
+          deltaY: -200,
+          clientX: startX,
+          clientY: startY,
+          bubbles: true,
+          cancelable: true
+        })
+      );
+      ok('滚轮放大生效', viewer.g.scale > 1.3, viewer.g.scale.toFixed(3));
+      viewer.g.reset(false);
+      ok('复位后 scale = 1', viewer.g.scale === 1);
+
+      /* ---------- 7.7 下拉关闭 ---------- */
+      pd('pointerdown', startX, startY, 3);
+      await sleep(16);
+      pd('pointermove', startX, startY + 60, 3);
+      await sleep(16);
+      pd('pointermove', startX, startY + 200, 3);
+      ok('纵向拖动进入 dismiss', viewer.g.mode === 'dismiss', String(viewer.g.mode));
+      ok('下拉产生进度', viewer.g.dismissProgress > 0.2, viewer.g.dismissProgress.toFixed(2));
+      pd('pointerup', startX, startY + 200, 3);
+      await sleep(500);
+      ok('下拉松手后关闭', viewer.root.hidden === true);
+
+      /* ---------- 7.8 点图片外关闭 ---------- */
+      viewer.open(1, null);
+      await sleep(400); // 展开动画期间手势是冻结的
+      pd('pointerdown', 6, 6, 4);
+      pd('pointerup', 6, 6, 4);
+      await sleep(500);
+      ok('点图片外关闭', viewer.root.hidden === true, String(viewer.root.hidden));
+
+      /* ---------- 8. 窗口尺寸变化 ---------- */
+      // 无头环境改不了真实窗口大小，但直接改容器尺寸会走完全相同的重排逻辑。
+      //
+      // 唯一绕不过去的是 ResizeObserver 的**投递**：它只在产生渲染帧时才回调，
+      // 而 headless 在页面加载完之后就不出帧了（真实 Tauri 窗口每帧都在跑，
+      // 不存在这个问题）。所以这里两步走：
+      //   1. 断言三个组件确实都挂了 ResizeObserver（接线没断）；
+      //   2. 把 rAF 临时换成同步执行，再手动调它们的 onResize()（与 RO 回调
+      //      完全同一个入口），让「去重判断 → 合并到一帧 → 重排」确定性地跑完。
+      const sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
+      // 等「静止 → 自动隐藏」走完：IDLE_MS 触发 + 0.3s 淡出 + 余量
+      const IDLE_WAIT = IDLE_MS + 500;
+      const applyResize = async (fn) => {
+        const realRaf = window.requestAnimationFrame;
+        window.requestAnimationFrame = (cb) => {
+          cb(performance.now());
+          return 0;
+        };
+        try {
+          fn();
+        } finally {
+          window.requestAnimationFrame = realRaf;
+        }
+        await sleep2(20);
+      };
+      const rectOf = (g, i) => {
+        const el = g.mounted.get(i);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return {
+          x: Math.round(r.left),
+          y: Math.round(r.top),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          right: Math.round(r.right)
+        };
+      };
+      /** 已挂载格子的实际几何是否与布局表一致（重排遗漏就直接暴露在这里） */
+      const geomProblem = (g) => {
+        const host = g.root.getBoundingClientRect();
+        for (const [i, el] of g.mounted) {
+          const found = g.cellOf(i);
+          if (!found?.cell) return `index ${i} 无布局`;
+          const r = el.getBoundingClientRect();
+          if (Math.abs(r.width - found.cell.w) > 1) return `#${i} w ${Math.round(r.width)}≠${found.cell.w}`;
+          if (Math.abs(r.height - found.cell.h) > 1) return `#${i} h ${Math.round(r.height)}≠${found.cell.h}`;
+          if (Math.abs(r.left - (host.left + found.cell.x)) > 1) return `#${i} x 错位`;
+          if (r.right > host.right + 1) return `#${i} 溢出右边界`;
+        }
+        for (let k = 1; k < g.rows.length; k += 1) {
+          if (g.rows[k].y < g.rows[k - 1].y + g.rows[k - 1].h) return `第 ${k} 行与前一行重叠`;
+        }
+        return null;
+      };
+
+      /* ---- 8.1 多图网格：重排 + 滚动锚定 ---- */
+      const host2 = document.createElement('main');
+      host2.className = 'grid';
+      host2.style.cssText =
+        'position:fixed;left:0;top:0;width:900px;height:300px;visibility:hidden';
+      const sp2 = document.createElement('div');
+      sp2.className = 'grid-spacer';
+      host2.appendChild(sp2);
+      document.body.appendChild(host2);
+
+      const grid2 = new Grid({ root: host2, spacer: sp2, onActivate: () => {} });
+      grid2.setItems(
+        Array.from({ length: 60 }, (_, i) => ({
+          id: `g2-${i}`,
+          name: `g2-${i}.jpg`,
+          width: 1600,
+          height: 900
+        }))
+      );
+      const rowHBefore = grid2.rows[0].h;
+      host2.scrollTop = 600;
+      await sleep2(80);
+
+      const anchor = grid2.topIndex(host2.scrollTop);
+      const anchorBefore = rectOf(grid2, anchor);
+      const nodeBefore = grid2.mounted.get(anchor);
+
+      host2.style.width = '520px';
+      await applyResize(() => grid2.onResize());
+
+      ok('宽度变化触发重排', grid2._w === host2.clientWidth, `${grid2._w} vs ${host2.clientWidth}`);
+      ok('行高随容器宽度重算', grid2.rows[0].h !== rowHBefore, `${rowHBefore} → ${grid2.rows[0].h}`);
+      ok('已挂载格子几何已更新', geomProblem(grid2) === null, geomProblem(grid2) ?? '');
+      ok('重排不重建 DOM 节点', grid2.mounted.get(anchor) === nodeBefore);
+      const anchorAfter = rectOf(grid2, anchor);
+      ok(
+        '重排后锚点项仍在原位（滚动锚定）',
+        anchorBefore && anchorAfter && Math.abs(anchorAfter.y - anchorBefore.y) <= 4,
+        `${anchorBefore?.y} → ${anchorAfter?.y}`
+      );
+
+      // 宽度没变时不应重排（避免滚动条出现/消失引起的无谓抖动）
+      const heightBefore = grid2.totalHeight;
+      host2.style.height = '260px';
+      await applyResize(() => grid2.onResize());
+      ok('仅高度变化不重排行布局', grid2.totalHeight === heightBefore, `${heightBefore} vs ${grid2.totalHeight}`);
+
+      // 尺寸为 0（最小化 / 隐藏）时必须跳过，不能把布局算坏
+      host2.style.width = '0px';
+      host2.style.height = '0px';
+      await applyResize(() => grid2.onResize());
+      ok('容器尺寸为 0 时跳过重排', grid2._w === 520 - 10 || grid2._w > 0, String(grid2._w));
+      ok('零尺寸未破坏行布局', grid2.rows.length > 0 && grid2.rows[0].h > 0);
+      host2.remove();
+
+      /* ---- 8.2 预览区随容器重新适配 ---- */
+      ok(
+        '网格 / 预览 / 胶片条都挂了 ResizeObserver',
+        grid2._ro instanceof ResizeObserver &&
+          viewer._ro instanceof ResizeObserver &&
+          viewer.strip._ro instanceof ResizeObserver
+      );
+
+      viewer.open(2, null);
+      await sleep2(60);
+      const vroot = viewer.root;
+      const w1 = viewer.stage.clientWidth;
+      const box1 = { w: viewer.box.w, h: viewer.box.h };
+
+      vroot.style.width = '1100px';
+      vroot.style.height = '700px';
+      await applyResize(() => viewer.onResize());
+
+      const w2 = viewer.stage.clientWidth;
+      const item2 = viewer.currentItem;
+      const imgRect = viewer.currentSlot.__low.getBoundingClientRect();
+
+      ok('stage 宽度跟随容器', w2 !== w1 && w2 === 1100, `${w1} → ${w2}`);
+      ok('适配尺寸已重算', viewer.box.w !== box1.w, `${box1.w} → ${viewer.box.w}`);
+      ok(
+        '图片实际尺寸 = 适配尺寸',
+        near(imgRect.width, viewer.box.w, 1) && near(imgRect.height, viewer.box.h, 1),
+        `${Math.round(imgRect.width)}×${Math.round(imgRect.height)} vs ${viewer.box.w}×${viewer.box.h}`
+      );
+      ok(
+        '保持原始宽高比（不拉伸、不裁切）',
+        Math.abs(imgRect.width / imgRect.height - item2.width / item2.height) < 0.01,
+        (imgRect.width / imgRect.height).toFixed(3)
+      );
+      ok(
+        '图片仍在 stage 内且居中',
+        imgRect.width <= w2 + 1 &&
+          imgRect.height <= viewer.stage.clientHeight + 1 &&
+          near(centerOf(viewer.currentSlot.__low).x, stageCenter().x) &&
+          near(centerOf(viewer.currentSlot.__low).y, stageCenter().y)
+      );
+      ok('轨道基准偏移 = -1 屏', viewer.trackOffset === -w2, String(viewer.trackOffset));
+
+      /* ---- 8.3 改变尺寸保留缩放，只收敛平移 ---- */
+      viewer.g.commit({ scale: 2, tx: 400, ty: 0 });
+      const scaleBefore = viewer.g.scale;
+      vroot.style.width = '820px';
+      await applyResize(() => viewer.onResize());
+      const maxX = (viewer.box.w * viewer.g.scale - viewer.stage.clientWidth) / 2;
+      ok('改变尺寸保留缩放倍率', near(viewer.g.scale, scaleBefore, 0.001), viewer.g.scale.toFixed(3));
+      ok(
+        '平移被夹回新边界',
+        viewer.g.tx <= Math.max(0, maxX) + 1,
+        `tx=${viewer.g.tx.toFixed(1)} max=${Math.max(0, maxX).toFixed(1)}`
+      );
+      viewer.g.reset(false);
+
+      /* ---- 8.4 胶片条重新居中当前项 ---- */
+      viewer.strip.root.scrollLeft = 0;
+      await sleep2(30);
+      vroot.style.width = '380px';
+      await applyResize(() => {
+        viewer.onResize();
+        viewer.strip.onResize();
+      });
+      const curItem = viewer.strip.mounted.get(viewer.strip.index);
+      const cr = curItem?.getBoundingClientRect();
+      const sr = viewer.strip.root.getBoundingClientRect();
+      ok(
+        '尺寸变化后胶片条重新居中当前项',
+        cr && cr.left >= sr.left - 2 && cr.right <= sr.right + 2,
+        `item(${Math.round(cr?.left)},${Math.round(cr?.right)}) strip(${Math.round(sr.left)},${Math.round(sr.right)})`
+      );
+
+      vroot.style.removeProperty('width');
+      vroot.style.removeProperty('height');
+      await applyResize(() => viewer.onResize());
+      ok(
+        '还原尺寸后布局再次正确',
+        viewer.stage.clientWidth === stageW &&
+          viewer.trackOffset === -stageW &&
+          near(centerOf(viewer.currentSlot.__low).x, stageCenter().x)
+      );
+      await viewer.close();
+
+      /* ---------- 9. 空闲自动隐藏 vs 指针事件 ---------- */
+      viewer.open(1, null);
+      await sleep2(60);
+      const vr = viewer.root;
+      // 窄屏只有 414 宽，坐标必须按 stage 现算，不能写死
+      const midX = Math.round(viewer.stage.clientWidth / 2);
+      const midY = Math.round(viewer.stage.clientHeight / 2);
+
+      // 9.1 静止到点后进入 is-idle
+      viewer.bumpControls();
+      ok('刚唤醒时没有 is-idle', !vr.classList.contains('is-idle'));
+      await sleep2(IDLE_WAIT);
+      ok('静止到点后进入 is-idle', vr.classList.contains('is-idle'));
+
+      /*
+        9.1b 隐藏必须收掉 visibility，而不只是把 opacity 降到 0。
+
+        胶片条窗口半径 40 → 最多 81 个节点常驻 DOM，其中待加载项的 shimmer
+        动画是 `background-position` —— 这个属性**无法交给合成器**，每帧都要
+        在主线程重新光栅化一遍。只把 opacity 降到 0 并不会中止它们，于是
+        「界面看着已经空了，主线程还在满负荷刷渐变」，这就是空闲隐藏之后
+        反而变卡的直接原因。
+
+        这里不断言 getComputedStyle 的实时值：CSS transition 要靠渲染帧推进，
+        无头环境不可靠（和 ResizeObserver 是同一个坑）。改为直接校验样式表
+        规则本身 —— 防的是「有人把 visibility / pause 删掉」这种回归。
+       */
+      const cssText = await (await fetch('./styles/app.css')).text();
+      const idleBlock = (cssText.match(
+        /\.viewer\.is-idle\s+\.viewer-bar,[\s\S]*?\{([\s\S]*?)\}/
+      ) ?? [])[1];
+      ok(
+        '空闲规则同时收掉 visibility（让胶片条退出合成）',
+        /visibility:\s*hidden/.test(idleBlock ?? ''),
+        (idleBlock ?? '').replace(/\s+/g, ' ').slice(0, 80)
+      );
+      ok(
+        '空闲规则暂停 shimmer 动画（background-position 不合成）',
+        /\.viewer\.is-idle\s+\.strip-item\.is-pending::after\s*\{[^}]*animation-play-state:\s*paused/.test(
+          cssText
+        )
+      );
+      ok(
+        '恢复显示时 visibility 立刻生效（无延迟）',
+        /\.viewer-bar,\s*\.nav-btn,\s*\.viewer-strip\s*\{[^}]*visibility\s+0s\s+linear\s+0s/.test(
+          cssText
+        )
+      );
+
+      // 9.2 关键回归：仅移动鼠标（不按下）就必须唤醒。
+      //     空闲时光标是 cursor:none，若只有 pointerdown 能唤醒，用户移动鼠标
+      //     时屏幕上什么都不会发生 —— 观感就是「鼠标动不了、界面卡死」。
+      pd('pointermove', midX, midY, 7);
+      ok('移动鼠标即唤醒控件', !vr.classList.contains('is-idle'));
+
+      // 9.3 指针按着的时候绝不能进入 is-idle：
+      //     给持有捕获的控件加 pointer-events:none 会打断指针序列，
+      //     pointerup 可能永远收不到，手势状态就卡死了。
+      viewer.bumpControls();
+      pd('pointerdown', midX, midY, 8);
+      ok('按下后手势进入 busy', viewer.g.busy === true);
+      await sleep2(IDLE_WAIT);
+      ok('指针按住时不进入 is-idle', !vr.classList.contains('is-idle'));
+      ok('按住期间控件仍可交互', getComputedStyle(viewer.strip.root).visibility === 'visible');
+
+      // 9.4 松手后计时器要能重新走起来（不能因为上面让过一次就永远不隐藏）
+      pd('pointerup', midX, midY, 8);
+      ok('松手后不再 busy', viewer.g.busy === false);
+      await sleep2(IDLE_WAIT);
+      ok('松手并静止后恢复自动隐藏', vr.classList.contains('is-idle'));
+
+      // 9.5 指针状态兜底清理：失焦（切程序 / 最小化）不能留下残留 pointerId，
+      //     否则之后每次 pointermove 都会被当成拖拽并 preventDefault
+      viewer.bumpControls();
+      pd('pointerdown', midX, midY, 9);
+      ok('失焦前确有按下的指针', viewer.g.busy === true);
+      window.dispatchEvent(new Event('blur'));
+      ok('失焦后指针状态已清空', viewer.g.busy === false);
+      ok('失焦后 dragging 已复位', viewer.g.dragging === false);
+
+      // 残留清理后，移动鼠标不应再进入拖拽分支（swipeX 保持 0）
+      const swipeBefore = viewer.g.swipeX;
+      pd('pointermove', midX - 60, midY, 9);
+      pd('pointermove', midX - 120, midY, 9);
+      ok('失焦后移动不再被当作拖拽', viewer.g.swipeX === swipeBefore, String(viewer.g.swipeX));
+
+      // 9.6 组件销毁时同样要清干净
+      pd('pointerdown', midX, midY, 10);
+      const gOld = viewer.g;
+      gOld.detach();
+      ok('detach 后指针状态清空', gOld.busy === false && gOld.dragging === false);
+
+      await viewer.close();
+
+      /* ---------- 10. 关闭 ---------- */
+      viewer.open(1, null);
+      await viewer.close();
+      ok('关闭后隐藏', viewer.root.hidden === true);
+      ok('关闭后槽位清空', indexes().every((i) => i < 0), indexes().join(','));
+
+      /* ---------- 11. 从文件管理器打开（沉浸式预览） ---------- */
+
+      // 11.1 关闭即退出：这个窗口是为看这一张而存在的
+      let exitCalls = 0;
+      viewer.onExit = () => { exitCalls += 1; };
+      viewer.setExitOnClose(true);
+      viewer.open(1, null);
+      await viewer.close();
+      ok('沉浸式关闭后退出应用', exitCalls === 1, String(exitCalls));
+      viewer.setExitOnClose(false);
+      viewer.open(1, null);
+      await viewer.close();
+      ok('非沉浸式关闭不退出', exitCalls === 1, String(exitCalls));
+
+      // 11.2 目录里只有这一张图：不显示胶片条与左右按钮，计数器 1 / 1
+      const single = [{ id: 'solo', name: 'only-one.jpg', width: 800, height: 600 }];
+      viewer.setItems(single);
+      viewer.open(0, null);
+      ok('单图时隐去胶片条', viewer.root.classList.contains('no-strip'));
+      ok(
+        '单图时隐去左右按钮',
+        getComputedStyle(viewer.nextBtn).display === 'none',
+        getComputedStyle(viewer.nextBtn).display
+      );
+      ok('单图计数器 = 1 / 1', viewer.counterEl.textContent === '1 / 1', viewer.counterEl.textContent);
+      ok('单图显示文件名', viewer.titleEl.textContent === 'only-one.jpg', viewer.titleEl.textContent);
+      ok('单图时左右按钮均为禁用态', viewer.prevBtn.disabled && viewer.nextBtn.disabled);
+      await viewer.go(1);
+      ok('单图按「下一张」不越界', viewer.index === 0, String(viewer.index));
+      await viewer.close();
+
+      // 11.3 首 / 末张：默认禁用（并给回弹），不是循环
+      viewer.setItems(items);
+      viewer.open(0, null);
+      ok(
+        '首张时「上一张」禁用、「下一张」可用',
+        viewer.prevBtn.disabled === true && viewer.nextBtn.disabled === false,
+        `prev=${viewer.prevBtn.disabled} next=${viewer.nextBtn.disabled}`
+      );
+      await viewer.go(-1);
+      ok('首张再按「上一张」不越界', viewer.index === 0, String(viewer.index));
+      await viewer.jumpTo(items.length - 1);
+      ok(
+        '末张时「下一张」禁用、「上一张」可用',
+        viewer.nextBtn.disabled === true && viewer.prevBtn.disabled === false,
+        `prev=${viewer.prevBtn.disabled} next=${viewer.nextBtn.disabled}`
+      );
+      await viewer.go(1);
+      ok('末张再按「下一张」不越界', viewer.index === items.length - 1, String(viewer.index));
+
+      // 11.4 打开循环后首尾相接
+      viewer.setLoop(true);
+      ok('循环模式下末张「下一张」可用', viewer.nextBtn.disabled === false);
+      await viewer.go(1);
+      ok('循环：末张 → 首张', viewer.index === 0, String(viewer.index));
+      await viewer.go(-1);
+      ok('循环：首张 → 末张', viewer.index === items.length - 1, String(viewer.index));
+      viewer.setLoop(false);
+      await viewer.close();
+
+      // 11.5 沉浸式样式：浏览器界面（顶栏 / 网格 / 空状态）一律不出现
+      ok(
+        '沉浸式规则隐藏顶栏与网格',
+        /body\.is-immersive\s+\.topbar,[\s\S]*?\{[^}]*display:\s*none/.test(cssText)
+      );
+      ok(
+        '沉浸式规则隐藏空状态',
+        /body\.is-immersive\s+\.empty\s*\{[^}]*display:\s*none/.test(cssText)
+      );
+      ok(
+        '沉浸式下查看器铺满整个窗口',
+        /body\.is-immersive\s+\.viewer\s*\{[^}]*inset:\s*0/.test(cssText)
+      );
+
+      // 系统绘制的原生标题栏与预览面对不上色、也不受空闲计时控制，
+      // 所以进入沉浸式前必须先让后端把它关掉（且要在窗口点亮之前）。
+      const mainSrc = await (await fetch('./js/main.js')).text();
+      ok(
+        '进入沉浸式前关掉原生标题栏',
+        /setImmersiveChrome\(true\)/.test(mainSrc) &&
+          mainSrc.indexOf('setImmersiveChrome(true)') < mainSrc.indexOf('showWindow()')
+      );
+
+      /* ---------- 12. 标题栏与预览面的统一 ---------- */
+
+      const barEl = document.getElementById('viewer-bar');
+      const bgOf = (el) => getComputedStyle(el).backgroundColor;
+      viewer.open(1, null);
+      await sleep2(60);
+
+      // 主题切换时背景色是有过渡的，读计算值会读到中间帧。
+      // 这里要验的是「两者同源且同时变」，不是过渡本身 —— 先把过渡关掉。
+      const killTransition = document.createElement('style');
+      killTransition.textContent = '*, *::before, *::after { transition: none !important; }';
+      document.head.appendChild(killTransition);
+
+      // 从一个确定的状态出发：探针所在环境可能是浅色也可能是深色
+      applyTheme('dark');
+      await sleep2(30);
+      const darkBar = bgOf(barEl);
+      const darkBd = bgOf(viewer.backdrop);
+
+      // 12.1 背景同源：色值一致，且不能有渐变 / 毛玻璃造成观感差异
+      ok('标题栏背景色与预览背景一致', darkBar === darkBd, `${darkBar} vs ${darkBd}`);
+      ok(
+        '标题栏没有渐变（与纯色预览面无差异）',
+        getComputedStyle(barEl).backgroundImage === 'none',
+        getComputedStyle(barEl).backgroundImage
+      );
+      ok(
+        '标题栏没有毛玻璃（backdrop-filter 会造成色差）',
+        (getComputedStyle(barEl).backdropFilter || 'none') === 'none',
+        String(getComputedStyle(barEl).backdropFilter)
+      );
+
+      // 12.2 深浅主题切换时两者一起变 —— 同一个变量，不可能只改掉一个
+      applyTheme('light');
+      await sleep2(30);
+      const lightBar = bgOf(barEl);
+      const lightBd = bgOf(viewer.backdrop);
+      ok(
+        '浅色主题下标题栏与预览背景仍一致',
+        lightBar === lightBd && lightBar !== darkBar,
+        `${lightBar} vs ${lightBd}`
+      );
+      ok('浅色主题确实改掉了预览背景', lightBd !== darkBd, `${darkBd} → ${lightBd}`);
+      applyTheme('dark');
+      await sleep2(30);
+      ok(
+        '切回深色后两者再次一致',
+        bgOf(barEl) === bgOf(viewer.backdrop) && bgOf(barEl) === darkBar,
+        `${bgOf(barEl)} vs ${bgOf(viewer.backdrop)}`
+      );
+      killTransition.remove();
+
+      // 12.3 三者共用同一条规则 → 同一时长、同一缓动、同一开关
+      const sharedRule =
+        (cssText.match(/\.viewer-bar,\s*\.nav-btn,\s*\.viewer-strip\s*\{([\s\S]*?)\}/) ??
+          [])[1] ?? '';
+      const idleRule =
+        (cssText.match(/\.viewer\.is-idle\s+\.viewer-bar,[\s\S]*?\{([\s\S]*?)\}/) ?? [])[1] ??
+        '';
+      ok(
+        '标题栏/按钮/胶片条共用一条显示规则',
+        /\.viewer-bar,\s*\.nav-btn,\s*\.viewer-strip\s*\{/.test(cssText) &&
+          /opacity\s+var\(--chrome-fade\)\s+var\(--chrome-ease\)/.test(sharedRule),
+        sharedRule.replace(/\s+/g, ' ').slice(0, 80)
+      );
+      ok(
+        '三者共用同一条隐藏规则（不会提前/延后）',
+        /\.viewer\.is-idle\s+\.viewer-bar,\s*\.viewer\.is-idle\s+\.nav-btn,\s*\.viewer\.is-idle\s+\.viewer-strip\s*\{/.test(
+          cssText
+        )
+      );
+      // 主题切换的那 0.15s：预览背景与标题栏必须同速，否则中间帧会露出色差
+      ok(
+        '预览背景与标题栏同速过渡',
+        /\.viewer-backdrop\s*\{[^}]*transition:\s*background\s+0\.15s\s+ease/.test(cssText) &&
+          /\.viewer-bar,\s*\.nav-btn,\s*\.viewer-strip\s*\{[^}]*background\s+0\.15s\s+ease/.test(
+            cssText
+          )
+      );
+      ok(
+        '隐藏规则同样只用共用时长与缓动',
+        /opacity\s+var\(--chrome-fade\)\s+var\(--chrome-ease\)/.test(idleRule) &&
+          /visibility\s+0s\s+linear\s+var\(--chrome-fade\)/.test(idleRule),
+        idleRule.replace(/\s+/g, ' ').slice(0, 80)
+      );
+
+      // 12.4 JS 阈值与 CSS 动画参数同源（chrome.js 写进 CSS 变量）
+      const rootStyle = getComputedStyle(document.documentElement);
+      ok(
+        'CSS 淡入淡出时长 = JS 常量',
+        rootStyle.getPropertyValue('--chrome-fade').trim() === `${FADE_MS}ms`,
+        `${rootStyle.getPropertyValue('--chrome-fade')} vs ${FADE_MS}ms`
+      );
+      ok(
+        'CSS 缓动 = JS 常量',
+        rootStyle.getPropertyValue('--chrome-ease').trim() === FADE_EASE,
+        `${rootStyle.getPropertyValue('--chrome-ease')} vs ${FADE_EASE}`
+      );
+
+      // 12.5 一起隐藏、一起出现；任意按键都能唤醒；隐藏不引起布局跳动
+      viewer.bumpChrome();
+      const rectBefore = viewer.stage.getBoundingClientRect();
+      ok('刚唤醒时标题栏可见', !vr.classList.contains('is-idle'));
+      await sleep2(IDLE_WAIT);
+      ok('静止到点后三者一起隐藏', vr.classList.contains('is-idle'));
+      const rectAfter = viewer.stage.getBoundingClientRect();
+      ok(
+        '隐藏控件不引起布局跳动（stage 几何不变）',
+        near(rectBefore.top, rectAfter.top) && near(rectBefore.height, rectAfter.height),
+        `${Math.round(rectBefore.top)}/${Math.round(rectBefore.height)} → ${Math.round(rectAfter.top)}/${Math.round(rectAfter.height)}`
+      );
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'x', bubbles: true }));
+      ok('任意按键都唤醒整套控件', !vr.classList.contains('is-idle'));
+
+      // 12.6 标题栏不遮挡画面：stage 把标题栏那一条让了出来
+      const barRect = barEl.getBoundingClientRect();
+      const stageRect = viewer.stage.getBoundingClientRect();
+      ok(
+        'stage 让出标题栏高度（图片不会被压在标题栏下）',
+        stageRect.top >= barRect.bottom - 1,
+        `stage.top=${Math.round(stageRect.top)} bar.bottom=${Math.round(barRect.bottom)}`
+      );
+      await viewer.close();
+
+      /* ---------- 13. 默认深色 / 手动切换 / 持久化 / 对比度 ---------- */
+
+      // 先把「当前主题」这个小工具备好，下面几段都要用
+      const currentThemeAttr = () => document.documentElement.dataset.theme;
+      const prefersLight = window.matchMedia?.('(prefers-color-scheme: light)').matches;
+
+      // 13.1 默认深色：没手动选过就一定是深色，**不看系统外观**
+      localStorage.removeItem(theme.THEME_KEY);
+      ok('未手动选择时读取不到偏好', theme.readPreference() === null);
+      applyTheme('light'); // 先制造一个「现在不是深色」的现场
+      ok(
+        '未手动选择时一律解析为深色（系统偏好说了不算）',
+        theme.resolveTheme() === 'dark' && theme.DEFAULT_THEME === 'dark',
+        `resolve=${theme.resolveTheme()} 系统偏好=${prefersLight ? 'light' : 'dark'}`
+      );
+      theme.initTheme();
+      ok(
+        '默认装载后 DOM 上就是深色',
+        document.documentElement.dataset.theme === 'dark',
+        String(document.documentElement.dataset.theme)
+      );
+
+      // 13.2 手动切换 → 立刻生效 + 写进 localStorage
+      theme.setTheme('light');
+      ok('切到浅色后 DOM 立刻跟上', currentThemeAttr() === 'light');
+      ok(
+        '手动选择写进了 localStorage',
+        localStorage.getItem(theme.THEME_KEY) === 'light',
+        String(localStorage.getItem(theme.THEME_KEY))
+      );
+      ok('再读偏好已经是浅色', theme.readPreference() === 'light');
+
+      // 13.3 持久化：模拟「下次打开」 —— 重新按存储解析一遍
+      theme.initTheme();
+      ok('重新装载仍是浅色（覆盖了默认深色）', currentThemeAttr() === 'light');
+      theme.toggleTheme();
+      ok('再翻一次回到深色', currentThemeAttr() === 'dark');
+      ok(
+        '翻转结果同样被记住',
+        localStorage.getItem(theme.THEME_KEY) === 'dark',
+        String(localStorage.getItem(theme.THEME_KEY))
+      );
+
+      // 非法值不能污染主题：认不出来就退回深色
+      localStorage.setItem(theme.THEME_KEY, 'sepia');
+      ok('非法存储值退回深色', theme.resolveTheme() === 'dark');
+      localStorage.removeItem(theme.THEME_KEY);
+
+      // 13.4 对比度：AA 正文 4.5:1、图形/描边 3:1。
+      // 只看不透明令牌（半透明那几人组要合成之后才有意义，这里不假装算得准）。
+      const noTransition2 = document.createElement('style');
+      noTransition2.textContent = '*, *::before, *::after { transition: none !important; }';
+      document.head.appendChild(noTransition2);
+
+      const varOf = (name) =>
+        getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      const srgb = (c) => {
+        const v = c / 255;
+        return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+      };
+      // 半透明令牌先合成到它的承载面上再算：`rgba(0,0,0,.45)` 单独是算不出
+      // 对比度的，而实际叠出来的那块深色（#101115 / #747678）完全可以。
+      const over = (rgba, base) => {
+        const nums = rgba.match(/[\d.]+/g).map(Number);
+        const [r, g, b, a = 1] = nums;
+        const toLin = Array.from(base.match(/\w\w/g), (h) => parseInt(h, 16) / 255);
+        const mix = [1 - a, 1 - a, 1 - a].map(
+          (k, i) => Math.round([r, g, b][i] * a + toLin[i] * 255 * k)
+        );
+        return `rgb(${mix.join(', ')})`;
+      };
+
+      const channel = (c) => (c > 1 ? srgb(c) : c);
+      const lum = (color) => {
+        const parts = color.startsWith('#')
+          ? Array.from(color.slice(1).match(/\w\w/g), (h) => channel(parseInt(h, 16)))
+          : color.match(/[\d.]+/g).slice(0, 3).map((n) => channel(Number(n)));
+        const [r, g, b] = parts;
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      };
+      const ratio = (a, b) => {
+        const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+        return (hi + 0.05) / (lo + 0.05);
+      };
+
+      const basicPairs = [
+        ['--text', '--bg', 4.5],
+        ['--text', '--surface', 4.5],
+        ['--text', '--surface-2', 4.5],
+        ['--text-dim', '--bg', 4.5],
+        ['--text-dim', '--surface-2', 4.5],
+        ['--accent-ink', '--accent-solid', 4.5],
+        ['--viewer-text', '--viewer-bg', 4.5],
+        ['--viewer-dim', '--viewer-bg', 4.5],
+        ['--accent', '--bg', 3]
+      ];
+
+      const contrastOf = (label) => {
+        const bad = [];
+        for (const [fg, bg, min] of basicPairs) {
+          const r = ratio(varOf(fg), varOf(bg));
+          if (!(r >= min)) bad.push(`${fg}/${bg}=${r.toFixed(2)}<${min}`);
+        }
+        // 失败缩略图上的「!」：--fail-ink 压在 fail-scrim 上，先合成再比
+        const failBase = over(varOf('--fail-scrim'), varOf('--surface-2'));
+        const failRatio = ratio(varOf('--fail-ink'), failBase);
+        if (!(failRatio >= 4.5)) bad.push(`失败标记=${failRatio.toFixed(2)}<4.5`);
+        ok(`${label}主题对比度全部达标`, bad.length === 0, bad.join(' '));
+      };
+
+      theme.setTheme('dark', { remember: false });
+      contrastOf('深色');
+      theme.setTheme('light', { remember: false });
+      contrastOf('浅色');
+
+      // 13.5 「没有一个组件被落下」：遍历 DOM，凡是自己有底色/描边/文字色的
+      // 元素，深浅两套主题下必须表现出差异 —— 没差异说明它偷偷写死了颜色。
+      const snapshot = () => {
+        const map = new Map();
+        const nodes = [document.body, ...document.querySelectorAll('body *')];
+        for (const node of nodes) {
+          const cs = getComputedStyle(node);
+          map.set(node, {
+            bg: cs.backgroundColor,
+            fg: cs.color,
+            border: cs.borderTopColor + '|' + cs.borderBottomColor
+          });
+        }
+        return map;
+      };
+      const transparent = (v) => /rgba\(0, 0, 0, 0\)|transparent/.test(v);
+      theme.setTheme('dark', { remember: false });
+      const darkMap = snapshot();
+      theme.setTheme('light', { remember: false });
+      const lightMap = snapshot();
+
+      const stale = [];
+      for (const [node, d] of darkMap) {
+        const l = lightMap.get(node);
+        if (!l) continue;
+        const dColorless =
+          transparent(d.bg) && /rgb\(0, 0, 0\)|rgba\(0, 0, 0, 0\)/.test(d.border);
+        if (dColorless) continue; // 只有继承来的文字色，不算「自己有颜色」
+        // 有底色的组件必须跟着变；没底色的看文字色有没有跟上
+        const changed = transparent(d.bg) ? d.fg !== l.fg : d.bg !== l.bg;
+        if (!changed) {
+          stale.push(
+            `${node.tagName.toLowerCase()}${node.id ? '#' + node.id : '.' + (node.className || '').toString().split(' ')[0]}`
+          );
+        }
+      }
+      ok(
+        '深浅主题下没有组件停留在旧配色',
+        stale.length === 0,
+        stale.slice(0, 6).join(', ')
+      );
+
+      noTransition2.remove();
+
+      // 13.6 防闪：index.html 里那段同步脚本必须排在样式表**之前**，
+      // 顺序错了，页面还是会闪一帧浅色。
+      const htmlSrc = await (await fetch('./index.html')).text();
+      const scriptAt = htmlSrc.indexOf('localStorage.getItem(');
+      const linkAt = htmlSrc.indexOf('rel="stylesheet"');
+      ok('防闪脚本排在样式表之前', scriptAt > 0 && scriptAt < linkAt, `${scriptAt} < ${linkAt}`);
+      ok(
+        '防闪脚本的兜底分支是深色',
+        /var pref = 'dark'/.test(htmlSrc) && /root\.dataset\.theme = pref/.test(htmlSrc)
+      );
+      // （注释里提到它是在解释「为什么不接」，先把注释剥掉再判断）
+      ok(
+        '样式表里没有 prefers-color-scheme 兜底（否则默认值会被系统推翻）',
+        !/@media\s*\(prefers-color-scheme/.test(
+          cssText.replace(/\/\*[\s\S]*?\*\//g, '')
+        )
+      );
+
+      // 13.7 两个入口都要能切换（沉浸式下顶栏是 display:none，够不着）
+      const topbarBtn = document.getElementById('btn-theme');
+      const viewerBtn = document.getElementById('btn-theme-viewer');
+      ok('顶栏与预览标题栏各有一个主题开关', !!topbarBtn && !!viewerBtn);
+      // 探针不跑 main.js，挂载这一步要自己做（真实入口由 main.js 调）
+      theme.mountThemeToggles([topbarBtn, viewerBtn]);
+      theme.setTheme('dark', { remember: false });
+      topbarBtn.click();
+      ok('点顶栏开关能切到浅色', currentThemeAttr() === 'light');
+      viewerBtn.click();
+      ok('点预览里的开关能切回深色', currentThemeAttr() === 'dark');
+      ok(
+        '两个开关的文案跟着当前主题走',
+        viewerBtn.getAttribute('aria-label') === topbarBtn.getAttribute('aria-label') &&
+          /浅色/.test(viewerBtn.getAttribute('aria-label')),
+        String(viewerBtn.getAttribute('aria-label'))
+      );
+      localStorage.removeItem(theme.THEME_KEY);
+
+      // ---- 14. 「右键 → 打开方式」的直达全屏启动 -------------------------
+      const { launchOriginRect, launchWindowRect, CENTER_ZOOM_SCALE } =
+        await import('./js/launch.js');
+      const launchSrc = await (await fetch('./js/launch.js')).text();
+      const bootSrc = await (await fetch('./js/main.js')).text();
+
+      if (viewer.isOpen) await viewer.close();
+
+      // 14.1 后端给的来源点（物理像素 / 桌面坐标系）→ 视口坐标系里的矩形
+      const env = { dpr: 2, offsetX: 40, offsetY: 25, viewW: 800, viewH: 600 };
+      const originRect = launchOriginRect({ x: 1000, y: 500, size: 96 }, env);
+      // (1000/2 - 40, 500/2 - 25) = (460, 225)，再各减半格
+      ok(
+        '来源坐标按 dpr 与窗口位置换算到视口坐标系',
+        originRect &&
+          Math.abs(originRect.left - (460 - 48)) < 0.01 &&
+          Math.abs(originRect.top - (225 - 48)) < 0.01,
+        JSON.stringify(originRect)
+      );
+      ok(
+        '来源矩形以光标为中心，边长取传入值',
+        originRect.width === 96 && originRect.height === 96
+      );
+
+      // 14.2 拿不到来源时必须明确退回兜底，而不是返回一个歪掉的小矩形
+      ok('没有来源点时返回 null', launchOriginRect(null, env) === null);
+      ok(
+        '坐标不是数字时返回 null',
+        launchOriginRect({ x: NaN, y: 1, size: 96 }, env) === null
+      );
+      ok(
+        '边长为 0 时返回 null',
+        launchOriginRect({ x: 10, y: 10, size: 0 }, env) === null
+      );
+      ok(
+        '起点飞出屏幕时返回 null（宁可退化成中心放大）',
+        launchOriginRect({ x: 999999, y: 999999, size: 96 }, env) === null
+      );
+      ok('中心兜底倍率是 0.8', CENTER_ZOOM_SCALE === 0.8, String(CENTER_ZOOM_SCALE));
+
+      const windowRect = launchWindowRect();
+      ok(
+        '目标窗口矩形是有限正数（给后端趁窗口还藏着摆尺寸）',
+        [windowRect.x, windowRect.y, windowRect.width, windowRect.height].every(
+          Number.isFinite
+        ) &&
+          windowRect.width > 1 &&
+          windowRect.height > 1,
+        JSON.stringify(windowRect)
+      );
+
+      // 14.3 启动分支：主界面根本不能出现在这一条路上
+      ok('main.js 里有独立的启动分支', /async function bootLaunch/.test(bootSrc));
+      ok(
+        '启动分支走上之后直接 return，不会再显示主界面',
+        /if \(pending\?\.items\?\.length\) \{\s*await bootLaunch[\s\S]*?return;/.test(
+          bootSrc
+        )
+      );
+      ok(
+        '顺序是「先定窗口形态与尺寸 → 点亮 → 量布局 → 才播动画」',
+        /prepareLaunchWindow\(launchWindowRect\(\)\)\s*\.catch\([\s\S]*?const target = launchWindowRect\(\);\s*await waitFor\([\s\S]*?viewer\.openLaunch\(/.test(
+          bootSrc
+        )
+      );
+      ok(
+        '来源坐标那一问是并行发出去的，不排在点亮窗口之前（不拖慢首帧）',
+        bootSrc.indexOf('const originPromise = api.launchOrigin()') <
+          bootSrc.indexOf('await api\n    .prepareLaunchWindow('),
+        `${bootSrc.indexOf('const originPromise = api.launchOrigin()')} / ${bootSrc.indexOf('await api\n    .prepareLaunchWindow(')}`
+      );
+
+      ok(
+        '窗口原点取自可用区（screenX/screenY 在无边框最大化窗口上不可信）',
+        /offsetX: Number\(screen\.availLeft\)/.test(launchSrc) &&
+          !/offsetX: window\.screenX/.test(launchSrc)
+      );
+      ok(
+        '动画前要等窗口长到目标尺寸（否则起点按旧尺寸算就偏了）',
+        /const target = launchWindowRect\(\);\s*await waitFor\(\s*\(\) =>\s*Math\.abs\(document\.documentElement\.clientWidth - target\.width\) <= 2/.test(
+          bootSrc
+        )
+      );
+
+      // 14.4 起点优先级的 Levels：元素 > 矩形 > 中心
+      viewer.open(2, null);
+      const probeRect = { left: 60, top: 40, width: 120, height: 96 };
+      const view = viewer.view();
+      const expectScale = probeRect.width / viewer.box.w;
+      const expectTx = probeRect.left + probeRect.width / 2 - view.w / 2;
+      const expectTy = probeRect.top + probeRect.height / 2 - view.h / 2;
+      const expectStart = `translate3d(${expectTx}px, ${expectTy}px, 0) scale(${expectScale})`;
+
+      ok(
+        '给了来源矩形就以它为 FLIP 起点',
+        viewer.zoomStart(null, { fromRect: probeRect }) === expectStart,
+        String(viewer.zoomStart(null, { fromRect: probeRect }))
+      );
+      ok(
+        '没有来源信息时从中心 0.8 倍起步',
+        viewer.zoomStart(null, { centerScale: CENTER_ZOOM_SCALE }) ===
+          'translate3d(0px, 0px, 0) scale(0.8)'
+      );
+      ok(
+        '缩略图元素优先于矩形参数（网格那条路不受影响）',
+        viewer.zoomStart(probeRect, {
+          fromRect: { left: 0, top: 0, width: 8, height: 8 }
+        }) === expectStart
+      );
+      ok(
+        '三者都没有就退回普通淡入',
+        viewer.zoomStart(null, {}) === null
+      );
+
+      // 14.5 真实调用：无来源 → 中心 0.8 + 透明度渐变 + 沿用既有时长缓动
+      await viewer.close();
+      clearAnimations();
+      viewer.openLaunch(2, null);
+      const launched = lastOf(viewer.slots[1]);
+      ok(
+        '无来源时首帧是中心 0.8 倍',
+        launched?.keyframes?.transform?.[0] === 'translate3d(0px, 0px, 0) scale(0.8)',
+        String(launched?.keyframes?.transform?.[0])
+      );
+      ok(
+        '终帧落到适配位置',
+        launched?.keyframes?.transform?.[1] === 'translate3d(0px, 0px, 0) scale(1)'
+      );
+      ok(
+        '开局带透明度渐变',
+        Array.isArray(launched?.keyframes?.opacity) &&
+          launched.keyframes.opacity[0] === 0 &&
+          launched.keyframes.opacity[1] === 1,
+        JSON.stringify(launched?.keyframes?.opacity)
+      );
+      ok(
+        '时长与缓动与现有预览动画一致',
+        launched?.options?.duration === OPEN_MS && launched?.options?.easing === OPEN_EASE,
+        `${launched?.options?.duration} / ${launched?.options?.easing}`
+      );
+
+      // 14.6 有来源 → 起点就是那一格
+      await viewer.close();
+      clearAnimations();
+      viewer.openLaunch(2, probeRect);
+      const zoomed = lastOf(viewer.slots[1]);
+      ok(
+        '有来源矩形时首帧正是那一格的位置与大小',
+        zoomed?.keyframes?.transform?.[0] === expectStart,
+        String(zoomed?.keyframes?.transform?.[0])
+      );
+
+      // 14.7 动画不等图片：调用一回来就已经在工作了，图片还没到
+      ok(
+        'openLaunch 同步返回，不等图片解码',
+        viewer.isOpen === true && viewer.slots[1].__low.complete === false,
+        `isOpen=${viewer.isOpen} complete=${viewer.slots[1].__low.complete}`
+      );
+      await viewer.close();
+
+      } catch (error) {
+        log.push(`THREW ${error && error.stack ? error.stack.split('\n')[0] : String(error)}`);
+      }
+      out.textContent = log.join('\n');
+      document.title = log.some((l) => l.startsWith('FAIL') || l.startsWith('THREW'))
+        ? 'HAS-FAIL'
+        : 'ALL-PASS';
+    </script>
+  </body>
+</html>

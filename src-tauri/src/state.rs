@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -12,7 +12,7 @@ use std::{
 use moka::sync::Cache;
 use parking_lot::RwLock;
 
-use crate::model::ImageItem;
+use crate::model::{ImageItem, LaunchOrigin, LaunchPayload};
 
 /// 内存缓存上限（字节）。缩略图/占位图体积都很小，256MB 足够覆盖几千张。
 const MEM_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -30,6 +30,24 @@ pub struct AppState {
     /// 缓存命中/未命中计数，仅用于状态展示
     hits: AtomicU64,
     misses: AtomicU64,
+    /// 系统（Finder / 资源管理器 / 命令行）要求打开的文件。
+    ///
+    /// 前端首屏可能还没装配完——那时事件没人接，所以既发事件也留一份，
+    /// 由前端 ready 后主动 `take_launch_target()` 取走。
+    launch: RwLock<Option<LaunchPayload>>,
+    /// 前端是否已上报首屏就绪（见 `commands::window_ready`）。
+    ready: AtomicBool,
+    /// 本次启动是不是「被系统要求打开某张图」唤起的。
+    launched: AtomicBool,
+    /// 目标文件名（用于窗口标题）。
+    launch_title: RwLock<Option<String>>,
+    /// 是否处于沉浸式预览（无原生标题栏，画面铺满窗口）。
+    immersive: AtomicBool,
+    /// 「从文件管理器打开」时那张缩略图的近似位置（见 `model::LaunchOrigin`）。
+    ///
+    /// 由 `commands::capture_launch_origin` 在**后台线程**里补写，可能比前端
+    /// 取 `take_launch_target` 晚一点点；前端在真正要播动画前才读它。
+    launch_origin: RwLock<Option<LaunchOrigin>>,
 }
 
 impl Default for AppState {
@@ -45,6 +63,12 @@ impl Default for AppState {
             cache_dir: RwLock::new(None),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            launch: RwLock::new(None),
+            ready: AtomicBool::new(false),
+            launched: AtomicBool::new(false),
+            launch_title: RwLock::new(None),
+            immersive: AtomicBool::new(false),
+            launch_origin: RwLock::new(None),
         }
     }
 }
@@ -110,6 +134,64 @@ impl AppState {
             out.push(item);
         }
         out
+    }
+
+    /// 前端首屏已装配完（此后才能安全地显示窗口）。
+    pub fn set_ready(&self) {
+        self.ready.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
+    /// 记下「这次是被系统唤起看图的」，并留好窗口标题。
+    pub fn mark_launched(&self, title: String) {
+        self.launched.store(true, Ordering::Relaxed);
+        *self.launch_title.write() = Some(title);
+    }
+
+    pub fn was_launched(&self) -> bool {
+        self.launched.load(Ordering::Relaxed)
+    }
+
+    pub fn launch_title(&self) -> Option<String> {
+        self.launch_title.read().clone()
+    }
+
+    /// 切到 / 退出沉浸式预览（无原生标题栏）。
+    ///
+    /// 由前端在打开大图前设置，后端据此在窗口显示前就把装饰关掉 ——
+    /// 亮起来之后再改形态，用户会看见标题栏「出现又消失」的跳动。
+    pub fn set_immersive(&self, enabled: bool) {
+        self.immersive.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_immersive(&self) -> bool {
+        self.immersive.load(Ordering::Relaxed)
+    }
+
+    /// 存一份待处理的「系统要求打开」请求。
+    pub fn set_launch(&self, payload: Option<LaunchPayload>) {
+        *self.launch.write() = payload;
+    }
+
+    /// 取走待处理的启动请求（取完即清空，避免重复打开）。
+    ///
+    /// 注意**不要**顺手清掉 `launch_origin`：那份数据是后台线程补写的，
+    /// 此刻大概率还没到 —— 清了就只剩中心兜底动画了。它的新鲜度由
+    /// `commands::deliver_launch` 在派发新请求时负责（先置空再重新询问）。
+    pub fn take_launch(&self) -> Option<LaunchPayload> {
+        self.launch.write().take()
+    }
+
+    /// 记下来源矩形（后台线程补写，见 `commands::capture_launch_origin`）。
+    pub fn set_launch_origin(&self, origin: Option<LaunchOrigin>) {
+        *self.launch_origin.write() = origin;
+    }
+
+    pub fn launch_origin(&self) -> Option<LaunchOrigin> {
+        *self.launch_origin.read()
     }
 
     pub fn item(&self, id: u32) -> Option<ImageItem> {

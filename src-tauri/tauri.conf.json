@@ -24,7 +24,6 @@
         "transparent": false,
         "backgroundColor": "#000000",
         "dragDropEnabled": true,
-        "theme": "Dark",
         "visible": false
       }
     ],
@@ -46,6 +45,70 @@
     "resources": [],
     "copyright": "",
     "category": "Photography",
+    "fileAssociations": [
+      {
+        "ext": ["jpg", "jpeg"],
+        "name": "JPEG 图片",
+        "description": "JPEG 图片",
+        "role": "Viewer",
+        "rank": "Default",
+        "mimeType": "image/jpeg",
+        "contentTypes": ["public.jpeg"]
+      },
+      {
+        "ext": ["png"],
+        "name": "PNG 图片",
+        "description": "PNG 图片",
+        "role": "Viewer",
+        "rank": "Default",
+        "mimeType": "image/png",
+        "contentTypes": ["public.png"]
+      },
+      {
+        "ext": ["gif"],
+        "name": "GIF 图片",
+        "description": "GIF 图片",
+        "role": "Viewer",
+        "rank": "Default",
+        "mimeType": "image/gif",
+        "contentTypes": ["com.compuserve.gif"]
+      },
+      {
+        "ext": ["webp"],
+        "name": "WebP 图片",
+        "description": "WebP 图片",
+        "role": "Viewer",
+        "rank": "Default",
+        "mimeType": "image/webp",
+        "contentTypes": ["org.webmproject.webp"]
+      },
+      {
+        "ext": ["bmp"],
+        "name": "BMP 图片",
+        "description": "BMP 图片",
+        "role": "Viewer",
+        "rank": "Default",
+        "mimeType": "image/bmp",
+        "contentTypes": ["com.microsoft.bmp"]
+      },
+      {
+        "ext": ["tif", "tiff"],
+        "name": "TIFF 图片",
+        "description": "TIFF 图片",
+        "role": "Viewer",
+        "rank": "Default",
+        "mimeType": "image/tiff",
+        "contentTypes": ["public.tiff"]
+      },
+      {
+        "ext": ["ico"],
+        "name": "ICO 图标",
+        "description": "ICO 图标",
+        "role": "Viewer",
+        "rank": "Default",
+        "contentTypes": ["com.microsoft.ico"]
+      }
+    ],
     "shortDescription": "沉浸式照片查看器",
     "longDescription": "PicShow 是一个轻量、跨平台的桌面照片查看器，复刻早期 Google Picasso 的流畅缩放、连续性转场与沉浸式交互体验。",
     "macOS": {

@@ -1,5 +1,5 @@
 /**
- * 手势控制器：滚轮 / 双击 / 双指捏合 / 拖拽平移 / 下拉关闭。
+ * 手势控制器：滚轮 / 双击 / 双指捏合 / 拖拽平移 / 横滑切换 / 下拉关闭。
  *
  * 对外暴露三样东西：
  *   * `scale`、`tx`、`ty` —— 当前变换；
@@ -10,6 +10,12 @@
  *   * `rawX/rawY` —— 「理想」平移，不含橡皮筋，是累加的基准；
  *   * `tx/ty`      —— 实际渲染用的平移 = clamp(raw) + rubberband(超出量)。
  * 分开存是为了避免橡皮筋位移被逐帧重复累加、导致越拖越偏。
+ *
+ * 两个变换目标（画廊模式下）：
+ *   * `el`    —— 当前那张 slide，承载缩放 / 平移 / 下拉关闭；
+ *   * `track` —— 横向轨道，承载左右滑动切换。
+ * 一次手势只会写其中一个：未放大时按首次移动的方向在「横滑 / 下拉」里二选一，
+ * 已放大时只能平移。事件统一挂在 track 上（它铺满视口），图片外的空白也能响应。
  */
 
 import { clamp, settle, zoomAround, isMostlyVertical } from './geometry.js';
@@ -23,6 +29,18 @@ const RUBBER = 140;
 const DISMISS_DISTANCE_RATIO = 0.2;
 /** 松手后判定为「关闭」的速度阈值（px/ms） */
 const DISMISS_VELOCITY = 0.55;
+/** 松手后判定为「切换」的位移阈值（视口宽度的比例） */
+const SWIPE_DISTANCE_RATIO = 0.22;
+/** 松手后判定为「切换」的速度阈值（px/ms） */
+const SWIPE_VELOCITY = 0.45;
+/**
+ * 只靠速度触发切换时的最小位移。
+ * 有些设备/合成器会在一帧里丢出一个跨度很大的 pointermove，
+ * 若只看「Δx ÷ Δt」会算出虚高的速度，手指几乎没动就被判成翻页。
+ */
+const SWIPE_MIN_PX = 28;
+/** 已经到首尾时，横滑跟随的阻尼系数（还能拖，但明显拖不动） */
+const SWIPE_EDGE_DAMP = 0.26;
 /** 双击识别窗口 */
 const DOUBLE_TAP_MS = 300;
 const DOUBLE_TAP_SLOP = 26;
@@ -30,6 +48,12 @@ const DOUBLE_TAP_SLOP = 26;
 const TAP_SLOP = 4;
 /** 惯性衰减系数（每帧） */
 const FLING_FRICTION = 0.93;
+/**
+ * 指针移动唤醒控件的最小间隔（ms）。
+ * 高频鼠标一帧能塞进好几个 pointermove，而唤醒要 clearTimeout + setTimeout +
+ * 改 class，没必要跟着鼠标事件一起刷 —— 节流到 ~8 次/秒，肉眼无差别。
+ */
+const MOTION_WAKE_MS = 120;
 
 export class Gestures {
   constructor(el, opts) {
@@ -38,14 +62,21 @@ export class Gestures {
       base: () => ({ w: 0, h: 0 }),
       view: () => ({ left: 0, top: 0, w: 0, h: 0 }),
       maxScale: 8,
+      track: null,
+      trackBase: () => 0,
+      canSwipe: () => false,
       onChange: () => {},
       onDismissProgress: () => {},
       onDismissRelease: () => {},
+      onSwipeRelease: () => {},
       onTap: () => {},
       onDoubleTap: () => {},
       onUserActivity: () => {},
       ...opts
     };
+
+    // 事件挂在哪：有 track 就挂 track（铺满视口），否则挂在变换目标本身
+    this.host = this.o.track ?? el;
 
     this.scale = 1;
     this.tx = 0;
@@ -53,6 +84,8 @@ export class Gestures {
     this.rawX = 0;
     this.rawY = 0;
     this.dismissProgress = 0;
+    /** 相对轨道基准的额外横移（px），仅 swipe 模式使用 */
+    this.swipeX = 0;
 
     this.pointers = new Map();
     this.start = null;
@@ -65,6 +98,7 @@ export class Gestures {
     this.vel = { x: 0, y: 0 };
     this.lastTap = null;
     this._tapTimer = 0;
+    this._lastMotion = 0;
     this.enabled = true;
 
     this._onDown = (event) => this.onPointerDown(event);
@@ -73,28 +107,34 @@ export class Gestures {
     this._onCancel = (event) => this.onPointerCancel(event);
     this._onWheel = (event) => this.onWheel(event);
     this._onDbl = (event) => this.onDoubleClick(event);
+    this._onBlur = () => this.abort();
 
     this.attach();
   }
 
   attach() {
-    this.el.addEventListener('pointerdown', this._onDown);
-    this.el.addEventListener('wheel', this._onWheel, { passive: false });
-    this.el.addEventListener('dblclick', this._onDbl);
+    this.host.addEventListener('pointerdown', this._onDown);
+    this.host.addEventListener('wheel', this._onWheel, { passive: false });
+    this.host.addEventListener('dblclick', this._onDbl);
     // move / up 挂在 window 上：指针移出元素也不会丢失事件
     window.addEventListener('pointermove', this._onMove, { passive: false });
     window.addEventListener('pointerup', this._onUp);
     window.addEventListener('pointercancel', this._onCancel);
+    // 窗口失焦 / 切到别的程序 / 最小化：指针序列会被系统截断，
+    // pointerup 可能永远收不到 —— 必须有个兜底把状态清干净
+    window.addEventListener('blur', this._onBlur);
   }
 
   detach() {
-    this.el.removeEventListener('pointerdown', this._onDown);
-    this.el.removeEventListener('wheel', this._onWheel);
-    this.el.removeEventListener('dblclick', this._onDbl);
+    this.host.removeEventListener('pointerdown', this._onDown);
+    this.host.removeEventListener('wheel', this._onWheel);
+    this.host.removeEventListener('dblclick', this._onDbl);
     window.removeEventListener('pointermove', this._onMove);
     window.removeEventListener('pointerup', this._onUp);
     window.removeEventListener('pointercancel', this._onCancel);
+    window.removeEventListener('blur', this._onBlur);
     this.cancelAnim();
+    this.resetPointerState();
   }
 
   /* ---------------- 状态 ---------------- */
@@ -103,12 +143,64 @@ export class Gestures {
     return this.scale > 1.02;
   }
 
+  /**
+   * 是否还有指针按着。
+   *
+   * 判断「正在交互」必须用这个，而不是 `dragging`：`dragging` 只是个标记，
+   * 一旦某次 pointerup 丢失（窗口失焦、元素被移除、祖先被加了
+   * `pointer-events:none`）它就再也不会复位；而 `pointers` 是真相来源，
+   * 配合 blur / pointercancel 的兜底清理不会长期跑偏。
+   */
+  get busy() {
+    return this.pointers.size > 0;
+  }
+
   transformString() {
     return `translate3d(${this.tx}px, ${this.ty}px, 0) scale(${this.scale})`;
   }
 
   apply() {
     this.el.style.transform = this.transformString();
+    this.applyTrack();
+  }
+
+  /** 轨道只做水平位移；基准由调用方给（当前槽位对应的偏移） */
+  applyTrack() {
+    if (!this.o.track) return;
+    const base = this.o.trackBase?.() ?? 0;
+    this.o.track.style.transform = `translate3d(${base + this.swipeX}px, 0, 0)`;
+  }
+
+  /**
+   * 轨道回弹 / 归位。与 `animateTo` 同样的技巧：先把终值写进 inline style，
+   * 动画 `fill:'none'`，结束瞬间样式天然接续，不会闪回起点。
+   */
+  animateTrackTo(swipeX, duration = 260, easing = EASE_OUT) {
+    if (!this.o.track) return Promise.resolve();
+    this.cancelAnim();
+
+    const base = this.o.trackBase?.() ?? 0;
+    const from = `translate3d(${base + this.swipeX}px, 0, 0)`;
+    const to = `translate3d(${base + swipeX}px, 0, 0)`;
+
+    this.swipeX = swipeX;
+    if (duration <= 0 || from === to) {
+      this.applyTrack();
+      return Promise.resolve();
+    }
+
+    const anim = this.o.track.animate(
+      { transform: [from, to] },
+      { duration, easing, fill: 'none' }
+    );
+    this.anim = anim;
+    this.applyTrack();
+
+    return anim.finished
+      .then(() => {
+        this.anim = null;
+      })
+      .catch(() => {});
   }
 
   emit() {
@@ -122,6 +214,7 @@ export class Gestures {
     this.ty = ty;
     this.rawX = tx;
     this.rawY = ty;
+    this.swipeX = 0;
     this.apply();
     this.emit();
   }
@@ -177,44 +270,34 @@ export class Gestures {
     return this.animateTo({ scale, tx: cx, ty: cy }, 340, EASE_SOFT);
   }
 
+  /**
+   * 容器尺寸变化后重新收敛。
+   *
+   * 注意**不能**用 `reset()`：那会把用户手动放大的倍率一起丢掉，
+   * 拖一下窗口就跳回 100% 很突兀。正确做法是保留倍率（只夹到新的
+   * 上限内），把平移重新夹进新的边界 —— 内容变小了自然回到居中。
+   */
+  refit({ base, view, maxScale }) {
+    if (maxScale != null) this.o.maxScale = maxScale;
+    const scale = clamp(this.scale, 1, Math.max(1, this.o.maxScale));
+    const bounds = panBoundsOf(view, base, scale);
+    const tx = clamp(this.rawX, -bounds.maxX, bounds.maxX);
+    const ty = clamp(this.rawY, -bounds.maxY, bounds.maxY);
+    this.swipeX = 0;
+    this.commit({ scale, tx, ty });
+  }
+
   /** 回到适配尺寸 */
   reset(animate = true) {
     this.rawX = 0;
     this.rawY = 0;
+    this.swipeX = 0;
     this.dismissProgress = 0;
     return this.animateTo(
       { scale: 1, tx: 0, ty: 0 },
       animate ? 280 : 0,
       EASE_OUT
     );
-  }
-
-  /** 到首尾时的轻微横向回弹提示 */
-  nudge(direction) {
-    const view = this.o.view();
-    const base = this.o.base();
-    const from = this.transformString();
-
-    this.rawX = -direction * 26;
-    const st = settle(view, base, this.scale, this.rawX, this.rawY, RUBBER);
-    const to = `translate3d(${st.x}px, ${st.y}px, 0) scale(${this.scale})`;
-
-    this.cancelAnim();
-    const anim = this.el.animate(
-      { transform: [from, to] },
-      { duration: 130, easing: EASE_OUT, fill: 'none' }
-    );
-    this.anim = anim;
-    this.tx = st.x;
-    this.ty = st.y;
-    this.apply();
-
-    return anim.finished
-      .then(() => {
-        this.anim = null;
-        return this.springBack();
-      })
-      .catch(() => {});
   }
 
   /** 以 p（视口中心为原点）为锚点缩放 */
@@ -276,7 +359,7 @@ export class Gestures {
       // 放大状态下只能平移；未放大时先不决定，等第一次移动再判断方向
       this.mode = this.isZoomed ? 'pan' : 'undecided';
       try {
-        this.el.setPointerCapture(event.pointerId);
+        this.host.setPointerCapture(event.pointerId);
       } catch {
         /* 某些浏览器对鼠标事件不支持捕获 */
       }
@@ -288,7 +371,51 @@ export class Gestures {
     this.emit();
   }
 
+  /**
+   * 指针移动唤醒控件（节流到 `MOTION_WAKE_MS`）。
+   *
+   * 这一步不能省：空闲状态下 CSS 会把 `cursor` 设成 `none`，指针彻底不可见。
+   * 如果只有 pointerdown / wheel / dblclick 能唤醒，那用户移动鼠标时屏幕上
+   * 什么都不会发生 —— 观感就是「鼠标动不了、界面卡死了」。
+   * 移动是最高频的交互，所以必须节流，不能每次事件都去续期计时器。
+   */
+  noteMotion() {
+    const now = performance.now();
+    if (now - this._lastMotion < MOTION_WAKE_MS) return;
+    this._lastMotion = now;
+    this.o.onUserActivity?.();
+  }
+
+  /**
+   * 强制收尾：指针序列被系统截断（失焦、最小化、切程序）或元素即将被移除时调用。
+   *
+   * 不清干净的话 `pointers` 会一直留着那个 pointerId，之后每次 pointermove
+   * 都会通过 `pointers.has(id)` 走进拖拽分支 —— 即使鼠标早就松开了，画面
+   * 也会一直「粘」在指针上；而且 `dragging` 恒为 true 会让 `Viewer.onResize()`
+   * 永远跳过手势收敛，改窗口尺寸后图片就不再重新适配。
+   */
+  abort() {
+    if (this.pointers.size === 0) return;
+    this.resetPointerState();
+    this.cancelAnim();
+    this.springBack();
+    this.emit();
+  }
+
+  resetPointerState() {
+    this.pointers.clear();
+    this.dragging = false;
+    this.moved = false;
+    this.start = null;
+    this.mode = null;
+    this.last = null;
+    this.vel = { x: 0, y: 0 };
+  }
+
   onPointerMove(event) {
+    // 无论是否按着，指针一动就把控件叫醒（见 noteMotion 注释）
+    this.noteMotion();
+
     if (!this.pointers.has(event.pointerId)) return;
     this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
 
@@ -306,7 +433,9 @@ export class Gestures {
 
     if (!this.moved && Math.hypot(dx, dy) > TAP_SLOP) {
       this.moved = true;
-      this.mode = this.isZoomed || !isMostlyVertical(dx, dy) ? 'pan' : 'dismiss';
+      if (this.isZoomed) this.mode = 'pan';
+      else if (isMostlyVertical(dx, dy)) this.mode = 'dismiss';
+      else this.mode = this.o.track ? 'swipe' : 'pan';
     }
     if (!this.moved) return;
 
@@ -315,7 +444,8 @@ export class Gestures {
     // 速度平滑（px/ms）
     const now = performance.now();
     const prev = this.last ?? { x: start.x, y: start.y, t: now - 16 };
-    const dt = Math.max(1, now - prev.t);
+    // 下限 4ms：同一毫秒里挤进来的多个 move 会算出离谱的速度
+    const dt = Math.max(4, now - prev.t);
     this.vel.x = this.vel.x * 0.6 + ((event.clientX - prev.x) / dt) * 0.4;
     this.vel.y = this.vel.y * 0.6 + ((event.clientY - prev.y) / dt) * 0.4;
     this.last = { x: event.clientX, y: event.clientY, t: now };
@@ -332,6 +462,11 @@ export class Gestures {
       this.rawX = this.tx;
       this.rawY = this.ty;
       this.o.onDismissProgress(this.dismissProgress);
+    } else if (this.mode === 'swipe') {
+      // 手指向左拖（dx < 0）→ 看下一张。到首尾只剩阻尼，告诉用户「没了」
+      const direction = dx < 0 ? 1 : -1;
+      const damping = this.o.canSwipe?.(direction) ? 1 : SWIPE_EDGE_DAMP;
+      this.swipeX = dx * damping;
     } else {
       this.rawX = start.rawX + dx;
       this.rawY = start.rawY + dy;
@@ -368,6 +503,18 @@ export class Gestures {
         Math.abs(dy) > window.innerHeight * DISMISS_DISTANCE_RATIO ||
         Math.abs(this.vel.y) > DISMISS_VELOCITY;
       this.o.onDismissRelease(shouldClose);
+    } else if (this.mode === 'swipe') {
+      const dx = event.clientX - this.start.x;
+      const direction = dx < 0 ? 1 : -1;
+      const passed =
+        Math.abs(dx) > this.o.view().w * SWIPE_DISTANCE_RATIO ||
+        (Math.abs(this.vel.x) > SWIPE_VELOCITY && Math.abs(dx) > SWIPE_MIN_PX);
+      if (passed && this.o.canSwipe?.(direction)) {
+        // 交给调用方接着手指的当前位置播完剩下的位移
+        this.o.onSwipeRelease(direction);
+      } else {
+        this.animateTrackTo(0, 280, EASE_SOFT);
+      }
     } else {
       const speed = Math.hypot(this.vel.x, this.vel.y);
       if (speed > 0.08) this.fling();
@@ -383,6 +530,7 @@ export class Gestures {
     this.dragging = false;
     if (this.pointers.size === 0) {
       if (this.mode === 'dismiss') this.o.onDismissRelease(false);
+      else if (this.mode === 'swipe') this.animateTrackTo(0, 280, EASE_SOFT);
       else this.springBack();
       this.mode = null;
       this.emit();
