@@ -1,6 +1,6 @@
 {
   "name": "picshow",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "PicShow —— Tauri 2 沉浸式跨平台照片查看器",
   "type": "module",
@@ -11,9 +11,10 @@
     "test": "node tools/test_geometry.mjs",
     "test:methods": "node tools/check_methods.mjs",
     "test:tokens": "node tools/check_tokens.mjs",
+    "test:boot": "node tools/check_boot.mjs",
     "rust:check": "cd src-tauri && cargo check",
     "rust:test": "cd src-tauri && cargo test",
-    "check": "npm run rust:check && npm test && npm run test:methods && npm run test:tokens",
+    "check": "npm run rust:check && npm test && npm run test:methods && npm run test:tokens && npm run test:boot",
     "probe": "node tools/probe_gallery.mjs"
   },
   "devDependencies": {

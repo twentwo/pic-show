@@ -167,6 +167,43 @@ export class Viewer {
     this.updateNavState();
   }
 
+  /**
+   * 把键盘焦点交给预览视图。
+   *
+   * 为什么必须显式做一次，而不是指望「点开预览时焦点自然就在页面上」：
+   *   * 窗口是**隐藏启动**的，webview 创建时不是 key window，第一响应者根本
+   *     不在页面上 —— 那之后不点一下画面，按键事件就进不来；
+   *   * `#viewer` 默认不可聚焦，`focus()` 打在它上面是空的，得先给它 tabindex。
+   *
+   * 用 `-1` 而不是 0：语义正是「程序可以聚焦、Tab 遍历不会绕进来」，预览里
+   * 没有需要用 Tab 走一遍的控件序列。
+   */
+  focusView() {
+    const node = this.root;
+    if (!node) return;
+    if (!node.hasAttribute('tabindex')) node.setAttribute('tabindex', '-1');
+    try {
+      node.focus({ preventScroll: true });
+    } catch {
+      node.focus();
+    }
+  }
+
+  /**
+   * 首图落地之后再把焦点交给预览视图。
+   *
+   * 不早设的理由很实在：点亮窗口之后还有 maximize、布局落定这几帧，它们会
+   * 把刚抢到的焦点冲掉；图片还在解码时按下的第一个方向键，落在的是「什么
+   * 都还没画出来」的画面。等第一帧真的有图了再落焦点，按下去就是立刻换一张。
+   *
+   * 带超时兜底：加载失败也不能把焦点一直吊着 —— 那时至少 DOM 焦点已经给了
+   * 预览，方向键切到下一张往往就救回来了。
+   */
+  async focusWhenReady(timeout = 4000) {
+    await imageReady(this.currentSlot, timeout);
+    this.focusView();
+  }
+
   /** 关闭后是否退出应用（「打开方式」进来的窗口，关掉就该彻底消失） */
   setExitOnClose(enabled) {
     this.exitOnClose = Boolean(enabled);
@@ -1026,6 +1063,44 @@ function setSrc(img, url) {
     return;
   }
   img.src = url;
+}
+
+/**
+ * 等某个槽里的图片真正落地（底图与原图谁先到算谁）。
+ *
+ * 焦点必须等这一刻：早了会落在「还没画出来的画面」上，用户按方向键以为
+ * 没反应。`timeout` 是必须的 —— 图片加载失败时 error 事件会到，但个别
+ * webview 在协议层出错时连 error 都不给，那时不能把调用方永远挂住。
+ */
+function imageReady(slide, timeout = 4000) {
+  const imgs = [slide?.__low, slide?.__full].filter(Boolean);
+  return new Promise((resolve) => {
+    if (!imgs.length) {
+      resolve();
+      return;
+    }
+    let done = false;
+    let timer = 0;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      for (const img of imgs) {
+        img.removeEventListener('load', finish);
+        img.removeEventListener('error', finish);
+      }
+      resolve();
+    };
+    timer = setTimeout(finish, timeout);
+    for (const img of imgs) {
+      if (img.complete && img.naturalWidth > 0) {
+        finish();
+        return;
+      }
+      img.addEventListener('load', finish);
+      img.addEventListener('error', finish);
+    }
+  });
 }
 
 /**

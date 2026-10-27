@@ -21,6 +21,13 @@ use tauri::{Listener, Manager};
 use state::AppState;
 
 pub fn run() {
+    // 启动意图在**第一行**就判定：命令行里带了图片路径，这次就是「被系统要求
+    // 看图」，主界面从头到尾都不该出现。
+    //
+    // 必须在 `build()`（它会创建窗口并让 webview 开始加载）之前做完：晚一步，
+    // 「主界面到底露不露面」就变成一个由前端加载速度决定的竞态了。
+    let cli_targets = commands::argv_targets();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -34,7 +41,9 @@ pub fn run() {
             commands::open_file_context,
             commands::take_launch_target,
             commands::launch_origin,
+            commands::launch_decision_budget,
             commands::prepare_launch_window,
+            commands::focus_window,
             commands::reveal_image,
             commands::cache_stats,
             commands::log_error,
@@ -95,9 +104,11 @@ pub fn run() {
     // 「从文件管理器打开」的第一条通道：进程参数。
     // Windows 关联打开、Linux .desktop 的 %F、以及命令行自测都走这里；
     // macOS 不走（LaunchServices 不把文件放进 argv），由下面的 Opened 事件接管。
-    let argv = commands::argv_targets();
-    if !argv.is_empty() {
-        commands::deliver_launch(app.handle(), argv);
+    //
+    // 注意这里**只是登记**，不点亮窗口：窗口是隐藏启动的，点亮由
+    // `prepare_launch_window` 独家负责，主界面因此一次都不会露面。
+    if !cli_targets.is_empty() {
+        commands::deliver_launch(app.handle(), cli_targets);
     }
 
     // 第二条通道：运行期事件。Finder 的「打开方式」在应用**已经运行**时

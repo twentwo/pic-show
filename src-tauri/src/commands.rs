@@ -114,6 +114,20 @@ pub fn open_file_context(app: AppHandle, path: String) -> Result<LaunchPayload, 
 const LAUNCH_ORIGIN_SIZE: f64 = 96.0;
 
 /**
+ * 「这次启动到底是不是被系统要求打开某张图」的判定窗口（毫秒）。
+ *
+ * Windows 的关联打开、Linux 的 `%F` 会把路径直接放进 argv —— 那在进程起来
+ * 的第一行就能判定，一次都不用等。macOS 不行：LaunchServices 不把文件放进
+ * argv，而是等事件循环转起来之后用 Apple Event 送来，那时前端首屏可能已经
+ * 装配完了。
+ *
+ * 于是给这条慢通道留一个**从进程启动时刻起算**的绝对预算：首屏但凡比它慢
+ * （真实情况几乎总是），前端来问时预算已经耗尽，常规启动一点没被拖慢；
+ * 万一前端快得离谱，也只是多藏了剩下的那几十毫秒 —— 窗口本来就是藏着的。
+ */
+const LAUNCH_DECIDE_MS: u64 = 300;
+
+/**
  * 后台线程里问一次光标位置，结果写进 `AppState::launch_origin`。
  *
  * **绝不能在主线程上直接问**：这条路 (`RuntimeHandle::cursor_position`)
@@ -156,6 +170,46 @@ fn read_cursor_origin(app: &AppHandle) -> Option<LaunchOrigin> {
     })
 }
 
+/**
+ * 距离「启动意图判定」截止还剩多少毫秒（0 = 立刻按常规启动走）。
+ *
+ * 前端首屏就绪时若还拿不到打开请求，就按这个预算再等一小会儿 —— 窗口反正
+ * 还藏着，等的代价是零；预算耗尽仍无消息，就说明这次确实是常规启动。
+ */
+#[tauri::command]
+pub fn launch_decision_budget(app: AppHandle) -> u64 {
+    app.state::<AppState>().launch_decision_budget(LAUNCH_DECIDE_MS)
+}
+
+/**
+ * 把键盘焦点交给主窗口。
+ *
+ * 必须由前端在「窗口已显示 + 首图已落地」之后调用一次，理由有三：
+ *
+ * 1. 窗口是**隐藏启动**的（`visible: false`，避免 webview 加载初期闪一帧
+ * 白底）。隐藏窗口上调用 `set_focus` 会被平台直接忽略（tao 的实现里第一条
+ * 判断就是 `isVisible`），所以焦点必须在 show 之后补；
+ * 2. `maximize()` 在 macOS 上是一次 zoom 动画，会把刚抢到的 key window
+ * 又让出去 —— 焦点要排在它**之后**；
+ * 3. 图片还在解码时设焦点，用户按下的第一个方向键会落在「还没画出来的
+ * 画面」上，观感就是「按了没反应」。
+ *
+ * 所以真正的顺序是：show → maximize → set_focus（本命令再补一次）。
+ */
+#[tauri::command]
+pub fn focus_window(app: AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    // 对还没点亮的窗口要焦点是没意义的，平台会直接忽略
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
+    if let Err(e) = window.set_focus() {
+        eprintln!("[picshow] 设置窗口焦点失败: {e}");
+    }
+}
+
 /// 前端在播放放大动画之前问一次来源矩形。
 ///
 /// 为什么单独一条命令而不是塞进 `take_launch_target` 的返回值：那条 IP C
@@ -168,12 +222,15 @@ pub fn launch_origin(app: AppHandle) -> Option<LaunchOrigin> {
 
 /**
  * 「打开方式」专用的一步到位入口：把窗口调成沉浸式形态 → 按屏幕尺寸摆好
- * → 点亮 → 最大化 → 改标题。
+ * → 点亮 → 最大化 → 抢焦点 → 改标题。
  *
  * 与常规入口的区别：常规入口是「先 `window_ready` 显示主界面，前端再决定
  * 要不要进预览」，中间那几帧用户是看得见的（先一个小窗口，再 maximize）。
  * 这条路径在窗口**还藏着**的时候就把尺寸定好，亮起来就已经是全屏，
  * 不存在「主界面一闪而过」。
+ *
+ * 这是**唯一**允许在「被系统要求打开图片的那次启动」里点亮窗口的地方，
+ * 所以焦点也要在这里收尾（见 `focus_window` 的注释）。
  */
 #[tauri::command]
 pub fn prepare_launch_window(app: AppHandle, rect: LaunchWindowRect) {
@@ -202,6 +259,12 @@ pub fn prepare_launch_window(app: AppHandle, rect: LaunchWindowRect) {
     reveal_main_window(&app);
 
     let _ = window.maximize();
+    // 焦点排在 maximize **之后**：macOS 的 maximize 是一次 zoom 动画，会把
+    // 刚抢到的 key window 让出去。少了这一步，用户就得先点一下画面，
+    // 方向键才肯工作。
+    if let Err(e) = window.set_focus() {
+        eprintln!("[picshow] 设置沉浸式窗口焦点失败: {e}");
+    }
     if let Some(name) = app.state::<AppState>().launch_title() {
         let _ = window.set_title(&format!("{name} — PicShow"));
     }
@@ -255,9 +318,13 @@ pub fn deliver_launch(app: &AppHandle, inputs: Vec<PathBuf>) {
             // 冷启动则**不能**在这里 show：窗口是隐藏启动的（避免白底闪一帧），
             // 只能等前端装配完自己上报 window_ready。
             if app.state::<AppState>().is_ready() {
-                // 已经跑起来了：把窗口叫到前台，并恢复沉浸式窗口形态
+                // 已经跑起来了：把窗口叫到前台，并恢复沉浸式窗口形态。
+                // 焦点排在最后：maximize 会把刚抢到的 key window 让出去。
                 reveal_main_window(app);
                 apply_immersive_window(app);
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_focus();
+                }
             }
         }
         Err(e) => eprintln!("[picshow] 打开外部文件失败: {e}"),
@@ -473,6 +540,21 @@ pub fn window_ready(app: AppHandle) {
     state.set_ready();
     if std::env::var("PICSHOW_DEBUG").is_ok() {
         eprintln!("[picshow] 前端首屏就绪");
+    }
+
+    // 「打开方式」那次启动：主界面**绝不能**在这里点亮。
+    //
+    // 那条路由 `prepare_launch_window` 负责 —— 它趁窗口还藏着把形态和尺寸定
+    // 好再点亮，亮起来就已经是全屏预览。这里一旦 show 出去，用户看见的就是
+    // 「主界面一闪而过，然后才变成全屏」，而这是无论如何都抹不掉的：窗口已经
+    // 被系统画出来了。
+    //
+    // 判断用「被要求打开过图片 **且** 那份请求还没被取走」：
+    //   * 有待取件 → 预览分支正在路上，这里必须让位；
+    //   * 已取走却还走到这一步 → 说明直达分支失败了，与其留一个隐身窗口，
+    //     不如点亮（lib.rs 里还有一道 3 秒兜底）。
+    if state.was_launched() && state.has_pending_launch() {
+        return;
     }
 
     // 顺序要紧：

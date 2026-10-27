@@ -1095,6 +1095,75 @@
       );
       await viewer.close();
 
+      // ---- 15. 启动后的键盘焦点 -----------------------------------------
+      // 「打开方式」启动的窗口是隐藏建起来的：webview 不是第一响应者，不显式
+      // 抢焦点的话，用户得先点一下画面，方向键才肯工作。这一节核对的是
+      // 「焦点什么时候落、落在哪儿」，顺序错了一样编译得过、跑得出。
+      const rootEl = document.getElementById('viewer');
+      ok(
+        '预览视图本身可聚焦（tabindex="-1"：程序可聚焦、不进 Tab 遍历）',
+        rootEl.getAttribute('tabindex') === '-1',
+        String(rootEl.getAttribute('tabindex'))
+      );
+
+      // 15.1 焦点不在「打开」那一刻抢 —— 那时图片还没到、窗口还在 maximize
+      document.body.focus();
+      await viewer.close();
+      viewer.openLaunch(2, null);
+      const focusing = viewer.focusWhenReady(600);
+      ok(
+        '首图未落地时不抢焦点（早了会被后面几帧冲掉）',
+        document.activeElement !== rootEl,
+        String(document.activeElement?.id || document.activeElement?.tagName)
+      );
+
+      // 15.2 首图落地 → 焦点立刻落在预览视图上
+      viewer.slots[1].__low.dispatchEvent(new Event('load'));
+      await focusing;
+      ok(
+        '首图落地后焦点自动落在预览视图上',
+        document.activeElement === rootEl,
+        String(document.activeElement?.id || document.activeElement?.tagName)
+      );
+
+      // 15.3 原图先到也算「落地」（底图失败、原图成功时不能把焦点吊着）
+      await viewer.close();
+      viewer.openLaunch(3, null);
+      const focusingFull = viewer.focusWhenReady(600);
+      viewer.slots[1].__full.dispatchEvent(new Event('load'));
+      await focusingFull;
+      ok(
+        '原图先到时同样立刻落焦点',
+        document.activeElement === rootEl,
+        String(document.activeElement?.id || document.activeElement?.tagName)
+      );
+
+      // 15.4 加载彻底失败也不能把焦点一直吊着：超时到了照样落
+      await viewer.close();
+      viewer.openLaunch(4, null);
+      const t0 = Date.now();
+      await viewer.focusWhenReady(30);
+      const waited = Date.now() - t0;
+      ok(
+        '图片迟迟不来时靠超时兜底（不会把焦点永远吊住）',
+        document.activeElement === rootEl && waited < 400,
+        `waited=${waited}ms active=${document.activeElement?.id}`
+      );
+
+      // 15.5 焦点落在预览上之后，方向键必须直接切图（无需先点一下）
+      await viewer.close();
+      viewer.openLaunch(2, null);
+      viewer.slots[1].__low.dispatchEvent(new Event('load'));
+      await viewer.focusWhenReady(600);
+      const before = viewer.index;
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+      ok(
+        '焦点在预览上时方向键直接切下一张',
+        viewer.index === before + 1,
+        `${before} -> ${viewer.index}`
+      );
+      await viewer.close();
+
       } catch (error) {
         log.push(`THREW ${error && error.stack ? error.stack.split('\n')[0] : String(error)}`);
       }

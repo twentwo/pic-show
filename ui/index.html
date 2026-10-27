@@ -124,7 +124,12 @@
     </section>
 
     <!-- ===================== 全屏查看器 ===================== -->
-    <div id="viewer" class="viewer" hidden>
+    <!--
+      tabindex="-1"：预览视图要能**被程序聚焦**但不进入 Tab 遍历。
+      「打开方式」启动时窗口是隐藏建起来的，webview 不是第一响应者，
+      不显式抢一次焦点，方向键就得等用户先点一下画面（见 Viewer#focusView）。
+    -->
+    <div id="viewer" class="viewer" tabindex="-1" hidden>
       <div class="viewer-backdrop"></div>
       <div class="viewer-stage"></div>
 

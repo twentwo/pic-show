@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use moka::sync::Cache;
@@ -48,6 +49,17 @@ pub struct AppState {
     /// 由 `commands::capture_launch_origin` 在**后台线程**里补写，可能比前端
     /// 取 `take_launch_target` 晚一点点；前端在真正要播动画前才读它。
     launch_origin: RwLock<Option<LaunchOrigin>>,
+    /// 进程启动时刻。
+    ///
+    /// 「这次启动是不是被系统要求打开某张图」这件事，在 macOS 上要到事件循环
+    /// 转起来之后才由 Apple Event 告知 —— 那时前端首屏可能已经装配完了。
+    /// 于是给它设一个**从进程启动时刻起算**的绝对截止点（见
+    /// `commands::LAUNCH_DECIDE_MS`）：早于截止点，主界面宁可继续藏着；
+    /// 过了截止点还没消息，就按常规启动点亮。
+    ///
+    /// 用绝对时刻而不是「从前端发问起等 N 毫秒」：前者在首屏加载慢的机器上
+    /// 剩余预算已经是 0，常规启动一点都不被拖慢。
+    started: Instant,
 }
 
 impl Default for AppState {
@@ -69,6 +81,7 @@ impl Default for AppState {
             launch_title: RwLock::new(None),
             immersive: AtomicBool::new(false),
             launch_origin: RwLock::new(None),
+            started: Instant::now(),
         }
     }
 }
@@ -174,6 +187,20 @@ impl AppState {
     /// 存一份待处理的「系统要求打开」请求。
     pub fn set_launch(&self, payload: Option<LaunchPayload>) {
         *self.launch.write() = payload;
+    }
+
+    /// 还有一份没被取走的「待取件」。
+    ///
+    /// `window_ready` 靠它判断「这次启动是不是已经被预览分支接管」：接管了就
+    /// 绝不能再点亮主界面，否则就是「主界面一闪而过」。
+    pub fn has_pending_launch(&self) -> bool {
+        self.launch.read().is_some()
+    }
+
+    /// 距离「启动意图判定」的截止时刻还剩多少毫秒（0 表示该决定了）。
+    pub fn launch_decision_budget(&self, budget_ms: u64) -> u64 {
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        budget_ms.saturating_sub(elapsed)
     }
 
     /// 取走待处理的启动请求（取完即清空，避免重复打开）。

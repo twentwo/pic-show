@@ -112,8 +112,73 @@ api.onItems(load).catch((error) => toast(String(error)));
  *   * 画廊集合是目标图片**所在目录**里的全部图片，按文件名排序。
  * ------------------------------------------------------------------ */
 
-/** 事件通道是否已经送来过打开请求（避免与「待取件」重复打开一次） */
-let launchByEvent = false;
+/** 这次启动的打开请求是否已经被某条通道接管（两条通道只认领一次） */
+let launchHandled = false;
+/** 窗口是否已经被点亮 —— 冷启动的预览分支要靠它决定走哪条路 */
+let windowShown = false;
+
+/**
+ * 认领一次「系统要求打开图片」的请求。
+ *
+ * 同一个请求会走**两条**通道同时到达前端：事件（应用已在跑时立刻生效）与
+ * 待取件（冷启动时事件早于监听注册，只能主动取）。两条都到的时候必须只处理
+ * 一次 —— 否则就是「打开 → 关掉 → 再打开」的一次实打实的闪烁。
+ */
+function claimLaunch(payload) {
+  if (launchHandled) return null;
+  if (!payload?.items?.length) return null;
+  launchHandled = true;
+  return payload;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 取一次「待取件」；取不到就照后端给的预算再等一小会儿。
+ *
+ * 为什么要等：Windows 的关联打开、Linux 的 `%F` 把路径直接放进 argv，进程
+ * 第一行就能判定这次是预览启动；macOS 不行 —— LaunchServices 不把文件放进
+ * argv，而是等事件循环转起来之后用 Apple Event 送来，而那可能比首屏还慢
+ * 半拍。这时候要是直接点亮主界面，用户看到的就是「主界面一闪而过，然后才
+ * 变成全屏预览」。
+ *
+ * 预算是**从进程启动时刻**起算的绝对值，不是「从现在起再等 N 毫秒」：首屏
+ * 加载慢的机器来问时预算早已经耗尽，常规启动一点都不会被拖慢。
+ */
+async function takeLaunchOrWait() {
+  const taken = claimLaunch(await api.takeLaunchTarget().catch(() => null));
+  if (taken) return taken;
+
+  let left = await api.launchDecisionBudget().catch(() => 0);
+  while (left > 0 && !launchHandled) {
+    await sleep(Math.min(left, 20));
+    const again = claimLaunch(await api.takeLaunchTarget().catch(() => null));
+    if (again) return again;
+    if (launchHandled) break;
+    left = await api.launchDecisionBudget().catch(() => 0);
+  }
+  return null;
+}
+
+/**
+ * 焦点交接：首图落地 → DOM 焦点交给预览 → 再向后端要一次窗口焦点。
+ *
+ * 三个条件缺一不可（理由见后端 `focus_window` 的注释）：窗口还没点亮时要
+ * 焦点会被平台直接忽略、maximize 会把刚抢到的焦点让出去、图片没到时按下去
+ * 的方向键落在空画面上。所以只能排在这儿 —— 窗口已显示、动画已开始、
+ * 首图正在落地。
+ */
+async function handOverFocus() {
+  await viewer.focusWhenReady().catch(() => {});
+  await api.focusWindow().catch(() => {});
+  // 「焦点到底落没落上」是典型的静默故障：界面上看不出焦点在哪儿。问一次并
+  // 打到终端（logError 只在 PICSHOW_DEBUG=1 时输出），以后排这一类问题不用
+  // 再靠猜。
+  api.logError(
+    `[focus] hasFocus=${document.hasFocus()} ` +
+      `active=${document.activeElement?.id || document.activeElement?.tagName}`
+  );
+}
 
 /**
  * 播放「从那一格长出来」的开场动画。
@@ -125,6 +190,7 @@ let launchByEvent = false;
 async function openLaunchView(payload) {
   const origin = await api.launchOrigin().catch(() => null);
   viewer.openLaunch(payload.index ?? 0, launchOriginRect(origin));
+  await handOverFocus();
 }
 
 async function enterImmersive(payload) {
@@ -132,6 +198,13 @@ async function enterImmersive(payload) {
   if (!items.length) return;
 
   document.body.classList.add('is-immersive');
+
+  // 冷启动时窗口**还藏着**：必须走启动分支（它会趁窗口藏着把形态与尺寸定好
+  // 再点亮）。直接在这儿开预览，动画就播给一个隐身窗口看了。
+  if (!windowShown) {
+    await bootLaunch(payload);
+    return;
+  }
 
   // 应用已经在跑、用户又从 Finder 打开了另一张：先关掉旧的再开新的。
   // 关之前必须临时摘掉「关闭即退出」，否则会在中途把应用整个退掉。
@@ -157,8 +230,8 @@ async function enterImmersive(payload) {
 }
 
 api.onLaunch((payload) => {
-  launchByEvent = true;
-  enterImmersive(payload);
+  const taken = claimLaunch(payload);
+  if (taken) enterImmersive(taken);
 }).catch((error) => toast(String(error)));
 
 /* ------------------------------------------------------------------ *
@@ -262,7 +335,6 @@ function applyHostMode() {
 }
 
 applyHostMode();
-dom.grid.focus();
 
 /**
  * 启动收尾。两条互不相干的路：
@@ -272,7 +344,9 @@ dom.grid.focus();
  *   * 常规启动 —— 点亮主界面（网格 / 空状态），等用户的下一步操作。
  *
  * 只在**该走的那一分支**上显示窗口，是「一闪而过」的唯一解药：主界面一旦
- * 被画出来，再隐藏就成了肉眼可见的闪。
+ * 被画出来，再隐藏就成了肉眼可见的闪。后端的 `window_ready` 里还有一道
+ * 闸门（被要求打开图片且请求尚未被取走时拒绝点亮），两边一起才堵得住
+ * macOS 那种「事件比首屏慢半拍」的竞态。
  */
 async function boot() {
   // 真正的首帧主题是 index.html 头部那段同步脚本落的（比 CSS 还早，所以不会
@@ -280,17 +354,27 @@ async function boot() {
   initTheme();
 
   let pending = null;
-  if (api.isTauri && !launchByEvent) {
-    pending = await api.takeLaunchTarget().catch(() => null);
+  if (api.isTauri && !launchHandled) {
+    pending = await takeLaunchOrWait().catch(() => null);
   }
+
+  // 顺序要紧：先认自己手里这一份，再看事件通道有没有抢先。
+  // 反过来写会永远走进「已被接管」—— `claimLaunch()` 认领成功后就会把
+  // `launchHandled` 置上，于是「自己取到的那份」也被当成别人处理过的了。
   if (pending?.items?.length) {
     await bootLaunch(pending).catch((error) =>
       api.logError(error?.stack || String(error))
     );
     return;
   }
+  // 事件通道已经在跑了（enterImmersive 自己会点亮窗口），这里再插手就重复了
+  if (launchHandled) return;
 
   await api.showWindow();
+  windowShown = true;
+  // 焦点给网格，回车就能打开第一张。沉浸式那条分支里网格是 display:none，
+  // 抢这一步只会把焦点从预览视图上挪走。
+  if (!document.body.classList.contains('is-immersive')) dom.grid.focus();
 }
 
 /**
@@ -313,12 +397,18 @@ async function bootLaunch(payload) {
   viewer.setItems(payload.items);
   viewer.setExitOnClose(true);
 
+  // 把后端那份「待取件」取走（不看结果）：一是保证同一次请求不会被两条通道
+  // 各处理一遍；二是让后端知道这次启动已经由预览分支接管 —— `window_ready`
+  // 据此拒绝再点亮主界面。
+  await api.takeLaunchTarget().catch(() => {});
+
   // 来源坐标这一问放在 promises 里**并行**跑出去，别把首帧拖住
   const originPromise = api.launchOrigin();
 
   await api
     .prepareLaunchWindow(launchWindowRect())
     .catch(() => api.showWindow());
+  windowShown = true;
 
   // 等窗口真的长到目标尺寸再开画：maximize 的结果常常比 IPC 回执晚一到两帧，
   // 而 FLIP 的起点是按**当前**可视区算的 —— 若按旧尺寸先算，动画就会从错误的
@@ -334,6 +424,8 @@ async function bootLaunch(payload) {
   const origin = await originPromise.catch(() => null);
   viewer.openLaunch(payload.index ?? 0, launchOriginRect(origin));
   refreshCacheStats({ delay: 300 });
+  // 等到首图落地再交焦点：早一步会被 maximize / 布局落定那几帧冲掉
+  await handOverFocus();
 }
 
 /**

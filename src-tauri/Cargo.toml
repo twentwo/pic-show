@@ -1,6 +1,6 @@
 [package]
 name = "picshow"
-version = "0.1.0"
+version = "0.1.1"
 description = "PicShow - 沉浸式跨平台照片查看器"
 authors = ["PicShow"]
 edition = "2021"

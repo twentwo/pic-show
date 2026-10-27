@@ -75,6 +75,23 @@ export const onLaunch = (handler) =>
 export const takeLaunchTarget = () => invoke('take_launch_target');
 
 /**
+ * 「这次是不是被系统要求打开某张图」还剩多少毫秒可以等。
+ *
+ * 首屏就绪时若还拿不到打开请求，就照这个预算再等一小会儿 —— 窗口反正还
+ * 藏着，等的代价是零。返回 0 就该立刻按常规启动点亮主界面。
+ */
+export const launchDecisionBudget = () =>
+    invoke('launch_decision_budget').catch(() => 0);
+
+/**
+ * 把键盘焦点交给主窗口（「打开方式」启动用）。
+ *
+ * 必须在「窗口已显示」且「首图已落地」之后调用：隐藏窗口上要焦点会被平台
+ * 忽略，maximize 又会把它让出去 —— 早一步设，用户就得先点一下画面。
+ */
+export const focusWindow = () => invoke('focus_window').catch(() => {});
+
+/**
  * 「打开方式」启动时那张缩略图的近似位置（`null` 表示拿不到）。
  *
  * 单独一条命令而不是塞进上面那个返回值：那份数据在后台线程里补写，

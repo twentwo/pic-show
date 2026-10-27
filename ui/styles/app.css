@@ -494,6 +494,18 @@ body.is-dragging::after {
   --chrome-top: 54px;
 }
 
+/*
+  预览视图会自己接管键盘焦点（见 `Viewer#focusView`）——「打开方式」启动时
+  窗口是隐藏建起来的，webview 不是第一响应者，不显式抢一次焦点的话，方向键
+  要等用户点一下画面才生效。
+
+  但它不该因此画出一个焦点框：整屏都是它自己，描一圈边只会破坏沉浸感。
+*/
+.viewer:focus,
+.viewer:focus-visible {
+  outline: none;
+}
+
 /* 单图时没有「列表」可言，让位给画面 */
 .viewer.no-strip {
   --strip-h: 0px;
