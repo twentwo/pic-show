@@ -763,10 +763,15 @@ export class Viewer {
    * ------------------------------------------------------------------ */
 
   attachGestures() {
+    const previous = this.g;
     this.g?.detach();
     this.g = new Gestures(this.currentSlot, {
       track: this.track,
       trackBase: () => this.trackOffset,
+      // 每次切换都会重建 Gestures，但「一次触控板横滑」是跨实例连续的物理
+      // 手势 —— 累积与冷却必须交接过去，否则实例一换就重新累积，一次甩动会
+      // 因为一路达标而连翻好几张
+      wheelState: previous?.wheelSwipe,
       base: () => this.box,
       view: () => this.view(),
       maxScale: this.maxScale(),
@@ -796,6 +801,11 @@ export class Viewer {
       },
       onSwipeRelease: (direction) => {
         this.go(direction, { fromSwipe: true });
+      },
+      // 触控板双指横滑：没有「手指已经拖出去的那段位移」要继承，走完整的
+      // 切换动画即可；已经到首尾时 go() 自己会给一下回弹，不必另铺一条路
+      onWheelSwipe: (direction) => {
+        this.go(direction);
       },
       onTap: (x, y) => this.onTap(x, y),
       onDoubleTap: (x, y) => this.toggleZoom(x, y),

@@ -16,6 +16,18 @@
  *   * `track` —— 横向轨道，承载左右滑动切换。
  * 一次手势只会写其中一个：未放大时按首次移动的方向在「横滑 / 下拉」里二选一，
  * 已放大时只能平移。事件统一挂在 track 上（它铺满视口），图片外的空白也能响应。
+ *
+ * 还有一条容易漏看的前提：**手指数 ≥ 2 就无条件进 pinch**（`updatePinch` 是
+ * 双指唯一的去处），既不判轴向也不设阈值。双指横滑切图曾经存在过（由某个
+ * `updateTwoFinger` 统一分发），因为和捏合共用同一份 scale/tx/ty、效果不好已经
+ * 回退 —— 现在双指横向移动只会被当成捏合：间距变了就是缩放，没变就是平移，
+ * 无论朝哪个方向、也无论是不是纯轴向。
+ *
+ * macOS 触控板的「双指横向滑动」是**另一条入口**，而且与上面这条毫无关系：
+ *   多指手势在 DOM 里永远凑不出第二个 pointerId —— 它们在派发给页面之前就被
+ *   系统翻译成了 wheel / ctrl+wheel / click。所以想接住触控板的双指横滑，只能
+ *   看 wheel 的 deltaX（见 `handleWheelHorizontal`）。反过来，触屏上的双指是
+ *   真·两个 pointer，那里的双指横向永远归 pinch，永不翻页。
  */
 
 import { clamp, settle, zoomAround, isMostlyVertical } from './geometry.js';
@@ -55,6 +67,55 @@ const FLING_FRICTION = 0.93;
  */
 const MOTION_WAKE_MS = 120;
 
+/** 触控板横向 wheel：横向增量必须比纵向大这么多，才认这一串是「在横滑」 */
+const WHEEL_AXIS_RATIO = 1.7;
+/**
+ * 这一段没有 wheel 事件就认为上一次手势结束了。
+ * 触控板「甩」一下会产出几十个事件（含惯性尾段），间隔通常 < 100ms；
+ * 而人换一次手势至少要抬手再落下，远超这个量级。
+ */
+const WHEEL_GESTURE_GAP_MS = 600;
+/**
+ * 累积位移的前这段距离直接不计：双指虚按在触控板上会持续产出 1~2px 的噪点，
+ * 跨过死区之后才开始判断要不要翻页。
+ */
+const WHEEL_SWIPE_DEADZONE = 8;
+/** 越过死区之后，再凑够这么多才算「确实在横滑」 */
+const WHEEL_SWIPE_TRAVEL = 12;
+/**
+ * 翻完一张之后，至少锁这么久。
+ *
+ * 两个下限叠出来的：一是 `viewer.js` 的切换动画 `SWITCH_MS = 300`（动画没走完
+ * 就再翻一张会看到画面突跳），二是触控板抬手后最初那几帧的增量还很大 ——
+ * 这段时间里哪怕是再大的增量也一律当作惯性残留。
+ */
+const WHEEL_SWITCH_LOCK_MS = 380;
+/**
+ * 这一段没有 wheel 事件，就认为「惯性尾巴已经结束」。
+ * 触控板甩一下的尾巴事件间隔通常 < 100ms，人重新推一次则至少几百毫秒。
+ */
+const WHEEL_TAIL_GAP_MS = 180;
+/**
+ * 解锁的第二条出口：单次增量回到本次手势峰值的这个比例，说明用户**又推了一把**
+ * 而不是惯性还在衰减。鼠标滚轮靠这条做到「一格一张」。
+ */
+const WHEEL_RESTART_RATIO = 0.8;
+/** 上面两条出口共同的最小幅度，滤掉抬手瞬间的反向抖动 */
+const WHEEL_RESTART_MIN_PX = 8;
+/** 反向推时的最小幅度：尾巴不会自己掉头，掉头就是用户改主意了 */
+const WHEEL_REVERSE_MIN_PX = 10;
+/**
+ * 锁定的硬上限。兜底用：万一某个设备/驱动的手势尾巴异常长，也不能把用户
+ * 永久锁死 —— 超过这个时长就放行。
+ */
+const WHEEL_LOCK_MAX_MS = 1200;
+/**
+ * 视口右边缘留给 macOS 通知中心的宽度。
+ * 从右边缘起手的横向滑动系统会拉出通知中心，此时若我们也切图就成了「两头
+ * 都响应」—— 抢不过系统，只能把这一片让出去。
+ */
+const EDGE_DEADZONE_PX = 48;
+
 export class Gestures {
   constructor(el, opts) {
     this.el = el;
@@ -64,11 +125,14 @@ export class Gestures {
       maxScale: 8,
       track: null,
       trackBase: () => 0,
+      /** 上一次实例的 `wheelSwipe`：一次触控板手势跨越多次图片切换，见构造末尾 */
+      wheelState: null,
       canSwipe: () => false,
       onChange: () => {},
       onDismissProgress: () => {},
       onDismissRelease: () => {},
       onSwipeRelease: () => {},
+      onWheelSwipe: () => {},
       onTap: () => {},
       onDoubleTap: () => {},
       onUserActivity: () => {},
@@ -100,6 +164,12 @@ export class Gestures {
     this._tapTimer = 0;
     this._lastMotion = 0;
     this.enabled = true;
+    /**
+     * 触控板横向 wheel 的累积状态，一次物理手势一份（见 handleWheelHorizontal）。
+     * 可能由上一个实例交接而来：每次切换图片都会重建 Gestures，而对用户来说
+     * 那一串 wheel 仍然是同一手势。
+     */
+    this.wheelSwipe = this.o.wheelState ?? freshWheelSwipe();
 
     this._onDown = (event) => this.onPointerDown(event);
     this._onMove = (event) => this.onPointerMove(event);
@@ -483,9 +553,11 @@ export class Gestures {
     if (!this.pointers.delete(event.pointerId)) return;
     this.dragging = false;
 
-    // 双指松开一根：以剩下那根重建基准，避免画面跳一下
+    // 捏合中松开一根（2 → 1）：以剩下那根重建单指基准。
+    // 这里曾经调的是 beginPinch()，但它对「只剩一根」是直接 return 的空操作
+    // —— 基准和 mode 于是永远停在捏合那一刻，见 releasePinch()。
     if (this.pointers.size === 1) {
-      this.beginPinch();
+      this.releasePinch();
       return;
     }
     if (this.pointers.size > 1) return;
@@ -565,6 +637,14 @@ export class Gestures {
     if (pts.length < 2) return;
     const view = this.o.view();
 
+    // 单指横滑中途落下第二根手指：横滑就此作废，轨道必须归位。
+    // pinch 全程只写缩放/平移、不碰 swipeX，不清的话那截偏移会一直挂在
+    // 轨道上 —— 松手后画面停在「半张图」的位置，只能靠再翻一页（go 里会
+    // 清 swipeX）或改窗口尺寸（refit）才自愈。
+    if (this.swipeX !== 0) {
+      this.animateTrackTo(0, 260, EASE_SOFT);
+    }
+
     this.mode = 'pinch';
     this.pinch = {
       d0: Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)),
@@ -577,7 +657,37 @@ export class Gestures {
     };
   }
 
-  /* ---------------- 捏合（由 `updateTwoFinger` 分发） ---------------- */
+  /**
+   * 捏合中抬起一根手指：把剩下那根当成一次全新的单指拖拽。
+   *
+   * 少了这一步会留下两个隐患（捏合期间没人管这两件事）：
+   *   1. `start` 还停在**最初那根**手指的落点，而活下来的若是另一根，下一次
+   *      移动算出的 dx 里会混进「两指间距」—— 画面瞬间跳几百 px；
+   *   2. `mode` 卡在 'pinch'，可 `onPointerMove` 里根本没有 pinch 分支，于是
+   *      静默落进通用 pan：行为看着能用，状态却是错的（连 `is-grabbing`
+   *      这类靠 mode 判断的反馈都会失真）。
+   *
+   * 一律判为 'pan'，而不是交回 'undecided' 让首个移动再定方向：捏合刚结束时
+   * 手指本来就带着余速，缩回适配尺寸后随手一划就被判成翻页太容易了。
+   */
+  releasePinch() {
+    const remaining = [...this.pointers.values()][0];
+    if (!remaining) return;
+
+    this.start = {
+      x: remaining.x,
+      y: remaining.y,
+      rawX: this.rawX,
+      rawY: this.rawY
+    };
+    this.last = { x: remaining.x, y: remaining.y, t: performance.now() };
+    this.vel = { x: 0, y: 0 };
+    this.moved = true;
+    this.mode = 'pan';
+    this.pinch = null;
+  }
+
+  /* ---------------- 捏合续：每帧更新（双指唯一的去处） ---------------- */
 
   updatePinch() {
     if (!this.pinch) return;
@@ -613,22 +723,197 @@ export class Gestures {
 
   /* ---------------- 滚轮 ---------------- */
 
+  /**
+   * 滚轮 / 触控板。
+   *
+   * 纵向（ `|deltaY|` 主导）= 缩放，这是自始就有的行为。
+   * 横向（`|deltaX|` 主导）= 触控板双指横滑 → 切换上一张 / 下一张（未放大），
+   * 或者横向平移（已放大）。这条新分支必须排在缩放**之前**：一次 wheel 序列
+   * 只允许一种归属，否则斜向滑会一边缩放一边连翻好几张。
+   */
   onWheel(event) {
-    if (!this.enabled) return;
-    event.preventDefault();
+    // 「滚动方向：自然」关掉时 delta 是整台翻转的，先归一化成手势方向，
+    // 「向左划」在每台机器上才是同一个意思（见 wheelSign）
+    const sign = wheelSign(event);
+    const dx = normalizeWheel(event, 'x') * sign;
+    const dy = normalizeWheel(event, 'y') * sign;
+
     this.o.onUserActivity?.();
+
+    // 横向判定必须排在 `enabled` 闸门**之前**。
+    // 切换动画那 300ms 里 `viewer.go()` 会把 enabled 关掉，但同一串惯性尾巴
+    // 并没有跟着停 —— 那段时间若完全不记账，动画一结束累积量就会被重新攒满，
+    // 「一次轻甩连翻好几张」多半是这么来的。
+    if (this.handleWheelHorizontal(event, dx, dy, this.enabled)) return;
+
+    if (!this.enabled) return;
+
     this.cancelAnim();
+    // 只有真正要消费的方向才阻止默认行为 —— 不消费时要还给系统
+    event.preventDefault();
 
     const view = this.o.view();
     // 触控板捏合在浏览器里表现为 ctrlKey=true 的 wheel 事件
     const intensity = event.ctrlKey ? 0.012 : 0.0022;
-    const delta = normalizeWheel(event);
-    const ratio = Math.exp(-delta * intensity);
+    const ratio = Math.exp(-dy * intensity);
     const p = {
       x: event.clientX - (view.left + view.w / 2),
       y: event.clientY - (view.top + view.h / 2)
     };
     this.zoomBy(ratio, p);
+  }
+
+  /**
+   * 触控板双指横向滑动 → 上一张 / 下一张（未放大）/ 横向平移（已放大）。
+   *
+   * 为什么在这里而不是 pinch 分支里：Mac 的多指手势到 DOM 之前就被系统翻译
+   * 成了 wheel / ctrl+wheel / click，`pointers.size >= 2` 那条 pinch 分支在
+   * 触控板上永远进不去 —— 想在 Mac 上接住双指横滑，只有 wheel 这一个入口。
+   *
+   * 方向约定与其他入口一致：内容跟着手指走。deltaX > 0 表示内容向左移动
+   * （等同于手指向左划）→ 下一张。
+   *
+   * @param {boolean} canFire 此刻能不能真的切图 —— 切换动画期间是 false，
+   *   但那一串 wheel 依然要被「吞下去」记账（见 wheelSwipe.locked）。
+   * @returns {boolean} true = 这次输入已被横向路径认领，调用方不要再当纵向处理。
+   *   注意「认领」不等于「消费」：还在观察阈值时不调用 preventDefault，
+   *   没有被这一条用掉的方向依旧还给浏览器。
+   */
+  handleWheelHorizontal(event, dx, dy, canFire) {
+    const now = performance.now();
+    const prev = this.wheelSwipe;
+    const sincePrev = now - prev.at;
+
+    // 静置太久 → 换了手势，累积、峰值、锁定全部作废。
+    // 顺序要紧：必须在**重新取** this.wheelSwipe 之前重置，否则 s 会指向刚被
+    // 丢掉的那个对象 —— 每个事件都从 0 开始累加，阈值永远攒不够。
+    if (sincePrev > WHEEL_GESTURE_GAP_MS) this.resetWheelSwipe();
+    const s = this.wheelSwipe;
+    s.at = now;
+
+    // 触控板捏合 / 旋转是 ctrl+wheel，与横滑互斥：改间距和横移是同一次
+    // 物理手势的两种解读，一次只认一种
+    if (event.ctrlKey) {
+      this.resetWheelSwipe();
+      return false;
+    }
+    // 右边缘属于 macOS 通知中心，那里的横向滑动两头都会响应 —— 让给系统
+    if (window.innerWidth - event.clientX <= EDGE_DEADZONE_PX) {
+      this.resetWheelSwipe();
+      return false;
+    }
+
+    // 轴向归属：整串序列只认一次，之后竖直方向再大的增量也不再翻回去
+    if (s.axis === null) {
+      if (dx !== 0 && Math.abs(dx) > WHEEL_AXIS_RATIO * Math.abs(dy)) s.axis = 'x';
+      else if (dy !== 0) s.axis = 'y';
+    }
+    if (s.axis !== 'x') return false;
+
+    const mag = Math.abs(dx);
+
+    // 已经翻过一张：把后面那一串惯性尾巴全吞掉，一次手势只许翻一张
+    if (s.locked) {
+      if (!this.wheelTailOver(s, sincePrev, dx, mag, now)) {
+        event.preventDefault();
+        return true;
+      }
+      // 尾巴结束了 → 从这里开始算新的一次手势（时间戳要留下来）
+      this.resetWheelSwipe();
+      this.wheelSwipe.at = now;
+    }
+
+    const t = this.wheelSwipe;
+    if (!t.locked) t.peak = Math.max(t.peak, mag);
+    t.x += dx;
+
+    // 已放大：横向的含义是「拖动画面」，不是翻页
+    if (this.isZoomed) {
+      this.cancelAnim();
+      event.preventDefault();
+      this.panByWheelX(dx);
+      return true;
+    }
+
+    // 一张图时横向没有任何意义，连回弹都别给 —— 邻槽是空的，回弹会把黑边拉出来
+    if (!this.o.canSwipe?.(1) && !this.o.canSwipe?.(-1)) return true;
+
+    // 还没走出抖动带 → 继续观察，不消费（也因此不阻止默认行为）
+    const travel = Math.abs(t.x) - WHEEL_SWIPE_DEADZONE;
+    if (travel < WHEEL_SWIPE_TRAVEL) return true;
+
+    // 方向要和单指横滑完全一致：那里的写法是 `dx < 0 ? 1 : -1`（手指向左拖
+    // → 下一张）。这里的 t.x 同样是屏幕坐标系里的手势位移（向左为负），所以
+    // 必须取负号 —— 之前漏了这一个负号，触控板上的左右就整个反过来了。
+    const direction = -Math.sign(t.x);
+    event.preventDefault();
+    // 先落锁再翻页：后面的尾巴（包括切图动画期间那一段）一律被吞，
+    // 而不是等翻页回调回来再补一道保险 —— 那时尾巴已经溜过去一大截了。
+    this.lockWheelSwipe(now, direction);
+    if (canFire) this.o.onWheelSwipe?.(direction);
+    return true;
+  }
+
+  /**
+   * 进入「这一串已经翻过一张」的状态：后续增量只记账、不再触发。
+   *
+   * 峰值 `peak` 特意保留 —— 它是后面判断「用户是不是重新发力了」的基准，
+   * 清掉会让重启判据恒真，等于锁了个寂寞。
+   */
+  lockWheelSwipe(now, direction) {
+    const s = this.wheelSwipe;
+    s.x = 0;
+    s.locked = true;
+    s.lockedAt = now;
+    s.dir = direction;
+  }
+
+  /**
+   * 锁定能不能解除 —— 也就是「上一次已经翻完，现在允许再翻一张了吗」。
+   *
+   * 四条出口，前一条不成立才看下一条：
+   *   1. 至少要锁够覆盖切换动画的时长，这段时间里什么都不认；
+   *   2. 尾巴确实停了（静默 ≥ WHEEL_TAIL_GAP_MS）之后，又来了一下有意识的推动；
+   *   3. 掉头了 —— 惯性尾巴不会自己反向，反向就是用户改主意了；
+   *   4. 幅度回到接近本次峰值 —— 用户又推了一把。鼠标滚轮（每格幅度恒定、
+   *      没有衰减尾巴）正是靠这条做到「一格一张」。
+   *
+   * 另外挂了一条硬上限：锁定超过 WHEEL_LOCK_MAX_MS 无条件放行，避免某个设备的
+   * 手势尾巴异常长时把用户永久锁住。
+   */
+  wheelTailOver(s, sincePrev, dx, mag, now) {
+    if (now - s.lockedAt < WHEEL_SWITCH_LOCK_MS) return false;
+    if (now - s.lockedAt > WHEEL_LOCK_MAX_MS) return true;
+    if (mag < WHEEL_RESTART_MIN_PX) return false;
+    if (sincePrev >= WHEEL_TAIL_GAP_MS) return true;
+    if (Math.sign(dx) === -Math.sign(s.dir) && mag >= WHEEL_REVERSE_MIN_PX) return true;
+    return mag >= s.peak * WHEEL_RESTART_RATIO;
+  }
+
+  /**
+   * 横向 wheel 平移（仅放大态）：内容跟着手势走。
+   *
+   * 传入的 dx 已经是屏幕坐标系下的手势位移，内容跟手 ⟹ 直接加到 rawX 上。
+   */
+  panByWheelX(dx) {
+    const view = this.o.view();
+    const base = this.o.base();
+    this.rawX += dx;
+    const st = settle(view, base, this.scale, this.rawX, this.rawY, RUBBER);
+    this.tx = st.x;
+    this.ty = st.y;
+    this.apply();
+    this.emit();
+  }
+
+  /**
+   * 清空一次横向 wheel 手势的累积。
+   *
+   * `axis` 也要一起清：它是「这一串已经认了横向」的凭据，留着会让下一次
+   * 纯纵向的滚轮也被判进横向分支，表现为「滚轮突然不缩放了」。
+   */
+  resetWheelSwipe() {
+    this.wheelSwipe = freshWheelSwipe();
   }
 
   onDoubleClick(event) {
@@ -677,9 +962,63 @@ function panBoundsOf(view, base, scale) {
   };
 }
 
-/** 统一不同浏览器 / 设备的 wheel 增量量纲 */
-function normalizeWheel(event) {
-  if (event.deltaMode === 1) return event.deltaY * 16; // DOM_DELTA_LINE
-  if (event.deltaMode === 2) return event.deltaY * window.innerHeight; // DOM_DELTA_PAGE
-  return event.deltaY;
+/**
+ * 一次横向 wheel 手势的初始状态。
+ *
+ * `locked` 是「已经翻过一张」的意思 —— 它和时间无关，生命的终点是**这一串
+ * wheel 真的结束了**，而不是一个固定倒计时：触控板抬手后的惯性尾巴能持续
+ * 一秒以上，靠倒计时挡不住，必须在尾巴停息后才解锁。
+ */
+function freshWheelSwipe() {
+  return {
+    axis: null,
+    /** 累积位移（手势方向） */
+    x: 0,
+    /** 上一个事件的时间戳：既用于判「换了手势」，也用于判「尾巴停了」 */
+    at: 0,
+    /** 本次手势里出现过的最大的单次增量，作为「重新发力」的比较基准 */
+    peak: 0,
+    locked: false,
+    lockedAt: 0,
+    /** 触发时的方向，用于识别反向重推 */
+    dir: 0
+  };
+}
+
+/**
+ * 统一不同浏览器 / 设备的 wheel 增量量纲。
+ * `deltaMode` 同时作用于两个轴，换算时得跟着轴走。
+ */
+function normalizeWheel(event, axis = 'y') {
+  const raw = axis === 'x' ? event.deltaX : event.deltaY;
+  if (event.deltaMode === 1) return raw * 16; // DOM_DELTA_LINE
+  if (event.deltaMode === 2) {
+    // DOM_DELTA_PAGE：翻页单位换算到「一屏」
+    return raw * (axis === 'x' ? window.innerWidth : window.innerHeight);
+  }
+  return raw;
+}
+
+/**
+ * 把 wheel 的 delta 换算成**屏幕坐标系下的手势方向**（向右为正、向下为正），
+ * 纵横两轴共用这一个系数。
+ *
+ * DOM 的约定是固定的：`deltaX > 0` = 向右滚动 = 内容向左；`deltaY > 0` =
+ * 向下滚动 = 内容向上。也就是说 DOM 的 delta 描述的是**内容的移动**，而不是
+ * 手指的移动；两者只有在 macOS 的「滚动方向：自然」开启时才同向。
+ *
+ *   * 自然滚动**开启**（出厂默认）：内容跟手 —— 内容向左 ⟹ 手指向左，
+ *     所以要取相反数才是手势方向；
+ *   * 自然滚动**关闭**：内容反向移动 —— 内容向左 ⟹ 手指向右，此时 DOM delta
+ *     在数值上恰好与手势方向一致。
+ *
+ * `webkitDirectionInvertedFromDevice === true` 表示的正是前一种情况：AppKit
+ * 已按用户偏好把 delta 反转过一次（本机就把这个开关关掉：
+ * `com.apple.swipescrolldirection = 1`）。该属性非标准（Chromium 恒为 false
+ * 是已知缺陷），所以只按值判断、不做 feature-detect，拿不到就按后一种处理。
+ *
+ * @returns {1 | -1}
+ */
+function wheelSign(event) {
+  return event.webkitDirectionInvertedFromDevice === true ? -1 : 1;
 }

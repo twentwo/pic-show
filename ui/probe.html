@@ -1164,6 +1164,372 @@
       );
       await viewer.close();
 
+      // ---- 16. 双指状态机与单指状态的交界 -------------------------------
+      // 这里没有「双指横滑切图」这一说了：手指数 ≥ 2 就无条件进 pinch，
+      // 不判轴向、不设阈值。所以真正容易出错的是**交界处**——单指横滑到一半
+      // 追加第二根手指、以及捏合中途抬起一根，这两处共用同一份
+      // scale/tx/ty/swipeX，状态不清理就会残留错位或整幅跳几百 px。
+      const gsrc = await (await fetch('./js/gestures.js')).text();
+      ok(
+        '16.1a 双指无任何轴向/阈值判定（≥2 指无条件进 pinch）',
+        /if \(this\.pointers\.size >= 2\) \{\s*event\.preventDefault\(\);\s*this\.updatePinch\(\);\s*return;/.test(
+          gsrc
+        )
+      );
+      // 只是文档里提了它当年的名字，不能真有定义或调用
+      ok(
+        '16.1b 代码里不再残留 updateTwoFinger 的定义或调用',
+        !/updateTwoFinger\s*\(/.test(gsrc) && !/function updateTwoFinger/.test(gsrc)
+      );
+      ok(
+        '16.1c 进入捏合前会先把轨道归位（守 swipeX 残留）',
+        /beginPinch\(\) \{[\s\S]*?if \(this\.swipeX !== 0\) \{\s*this\.animateTrackTo\(0/.test(
+          gsrc
+        )
+      );
+      ok(
+        '16.1d 抬起一根时由 releasePinch 接管（而不是空跑 beginPinch）',
+        /if \(this\.pointers\.size === 1\) \{\s*this\.releasePinch\(\);/.test(gsrc) &&
+          /releasePinch\(\) \{[\s\S]*?this\.mode = 'pan';[\s\S]*?this\.pinch = null;/.test(gsrc)
+      );
+
+      // open() 期间手势被临时冻结（防 FLIP 与手势打架），备-手势前要等它恢复
+      const tgOpen = async (index = 2) => {
+        if (viewer.isOpen) await viewer.close();
+        viewer.open(index, null);
+        await new Promise((r) => setTimeout(r, 300));
+        viewer.g.enabled = true;
+        viewer.g.swipeX = 0;
+        viewer.g.commit({ scale: 1, tx: 0, ty: 0 });
+        return viewer.g;
+      };
+      const tgX = Math.round(stage.clientWidth / 2);
+      const tgY = Math.round(stage.clientHeight / 2);
+
+      // 16.2 双指横向平移：既不分页、也不缩放（间距没变）
+      await tgOpen();
+      const tgIdx = viewer.index;
+      pd('pointerdown', tgX - 100, tgY, 1);
+      pd('pointerdown', tgX + 100, tgY, 2);
+      pd('pointermove', tgX - 160, tgY, 1);
+      pd('pointermove', tgX + 40, tgY, 2); // 整体左移 60，间距仍为 200
+      ok('16.2a 双指横向平移 → mode = pinch', viewer.g.mode === 'pinch', String(viewer.g.mode));
+      ok('16.2b 双指横向平移 → 不切换图片', viewer.index === tgIdx, `${tgIdx} → ${viewer.index}`);
+      ok('16.2c 双指横向平移 → 缩放保持 1', Math.abs(viewer.g.scale - 1) < 0.01, String(viewer.g.scale.toFixed(3)));
+      pd('pointerup', tgX - 160, tgY, 1);
+      pd('pointerup', tgX + 40, tgY, 2);
+      await viewer.g.springBack();
+
+      // 16.3 单指横滑中途追加第二根手指 → 轨道必须归位
+      await tgOpen();
+      pd('pointerdown', tgX + 220, tgY, 1);
+      pd('pointermove', tgX + 20, tgY, 1);
+      ok('16.3a 单指先进入 swipe', viewer.g.mode === 'swipe', String(viewer.g.mode));
+      ok('16.3b swipeX 跟手 -200', Math.abs(viewer.g.swipeX + 200) < 2, String(viewer.g.swipeX));
+      pd('pointerdown', tgX + 120, tgY, 2);
+      ok('16.3c 第二指落下立即清零 swipeX', viewer.g.swipeX === 0, String(viewer.g.swipeX));
+      pd('pointermove', tgX + 60, tgY, 1);
+      pd('pointermove', tgX + 180, tgY, 2);
+      pd('pointerup', tgX + 60, tgY, 1);
+      pd('pointerup', tgX + 180, tgY, 2);
+      await viewer.g.springBack();
+      // 读回来的样式已被浏览器序列化成 "...px, 0px, 0px"，比较取值而不是串
+      const tgTrackPx = Number(
+        (viewer.track.style.transform.match(/translate3d\(([-\d.]+)px/) || [])[1]
+      );
+      ok(
+        '16.3d 松手后轨道停在基准位（不残留半张图的偏移）',
+        viewer.g.swipeX === 0 && Math.abs(tgTrackPx - viewer.trackOffset) < 0.5,
+        `swipeX=${viewer.g.swipeX} track=${viewer.track.style.transform} base=${viewer.trackOffset}`
+      );
+
+      // 16.4 捏合中途抬起「建立基准的那根」手指 → 剩余手指接着拖不能跳
+      await tgOpen();
+      await viewer.g.zoomTo(2, { x: 0, y: 0 }, false);
+      pd('pointerdown', tgX - 100, tgY, 1); // id1 建立 this.start
+      pd('pointerdown', tgX + 100, tgY, 2);
+      pd('pointermove', tgX - 110, tgY, 1);
+      pd('pointermove', tgX + 90, tgY, 2);
+      const tgRaw = viewer.g.rawX;
+      pd('pointerup', tgX - 110, tgY, 1); // 抬掉 id1，留 id2
+      ok('16.4a 抬起一根后 mode 从 pinch 复位为 pan', viewer.g.mode === 'pan', String(viewer.g.mode));
+      pd('pointermove', tgX + 70, tgY, 2); // id2 继续左移 20
+      ok(
+        '16.4b 画面按剩余手指的位移走（不会混进两指间距）',
+        Math.abs(viewer.g.rawX - (tgRaw - 20)) < 3,
+        `${tgRaw.toFixed(1)} → ${viewer.g.rawX.toFixed(1)}，期望 ${(tgRaw - 20).toFixed(1)}`
+      );
+      pd('pointerup', tgX + 70, tgY, 2);
+      await viewer.g.springBack();
+      await viewer.close();
+
+      // ---- 17. 触控板双指横向滑动（macOS trackpad）------------------------
+      // Mac 的多指手势到 DOM 之前就被系统翻译成了 wheel / ctrl+wheel / click，
+      // pointer 里永远凑不出第二个 pointerId —— 所以这条功能只有一个入口：
+      // wheel 的 deltaX。这里全程用真实的 WheelEvent 派发来验证。
+      // wheel 事件默认补上 `webkitDirectionInvertedFromDevice = true`：
+      // headless 里这个属性恒为 false（Chromium 的已知缺陷），会被我们的归一化
+      // 当成「用户关闭了自然滚动」的机器；而 macOS 出厂默认是开启的那一类。
+      // 17.9 会单独构造缺失该属性的版本，覆盖另一种设置。
+      const wheel = (opts) => {
+        const { inverted = true, ...rest } = opts;
+        const ev = new WheelEvent('wheel', {
+          bubbles: true,
+          cancelable: true,
+          clientX: startX,
+          clientY: startY,
+          ...rest
+        });
+        if (inverted) {
+          Object.defineProperty(ev, 'webkitDirectionInvertedFromDevice', {
+            value: true
+          });
+        }
+        viewer.track.dispatchEvent(ev);
+        return ev;
+      };
+      // 每个场景都从「干净的一次手势」起步：tgOpen 会重建 Gestures，而真实
+      // 使用情况里状态是跨实例交接的（下一节的 17.2 会专门核对这一点），
+      // 所以这里必须显式清一次 —— 否则上一个场景把轴锁成横向会串到下一个场景。
+      const twOpen = async (index = 2) => {
+        const g = await tgOpen(index);
+        g.resetWheelSwipe();
+        return g;
+      };
+      const awaitGo = async () => {
+        for (let i = 0; i < 20 && viewer.switching; i += 1) await sleep(20);
+        await sleep(20);
+      };
+
+      // 17.1 纯横向轻扫 → 下一张
+      await twOpen(2);
+      const evIdle = wheel({ deltaX: 3, deltaY: 0 });
+      ok('17.1a 还在阈值内时不消费（默认行为不被阻断）', evIdle.defaultPrevented === false);
+      ok('17.1b 小幅噪点不翻页', viewer.index === 2, String(viewer.index));
+      const evFire = wheel({ deltaX: 24, deltaY: 0 });
+      await awaitGo();
+      ok('17.1c 越过阈值后切到下一张', viewer.index === 3, String(viewer.index));
+      ok('17.1d 真正翻页时才 preventDefault', evFire.defaultPrevented === true);
+
+      // 17.1e 累积是跨事件的：单个 10px 不够（越过 8px 死区后只剩 2），
+      //       两个 10px 才够 —— 这条同时守「重置后仍拿着旧引用」的写法
+      await twOpen(2);
+      wheel({ deltaX: 10, deltaY: 0 });
+      await awaitGo();
+      ok('17.1e 单个小幅 wheel 不翻页', viewer.index === 2, String(viewer.index));
+      wheel({ deltaX: 10, deltaY: 0 });
+      await awaitGo();
+      ok('17.1f 位移跨事件累加到阈值后才翻页', viewer.index === 3, String(viewer.index));
+
+      // 17.2 一次手势只翻一张：抬手后的惯性尾巴必须整串被吞掉
+      await twOpen(1);
+      // macOS 的典型尾巴：幅度单调衰减、间隔十几毫秒，且总长远超切换动画
+      const tail = [26, 22, 18, 14, 11, 9, 7, 5, 4, 3, 2, 1];
+      wheel({ deltaX: 30, deltaY: 0 });
+      await awaitGo();
+      ok('17.2a 越过阈值触发一次切换', viewer.index === 2, String(viewer.index));
+      ok(
+        '17.2b 触发后立刻落锁（不是等回调回来再补保险）',
+        viewer.g.wheelSwipe.locked === true,
+        String(viewer.g.wheelSwipe.locked)
+      );
+      for (const d of tail) wheel({ deltaX: d, deltaY: 0 });
+      await awaitGo();
+      ok(
+        '17.2c 同一串 wheel 的衰减尾巴不会连翻（一次一张）',
+        viewer.index === 2,
+        String(viewer.index)
+      );
+      ok(
+        '17.2d 锁定状态跨实例交接（不随 Gestures 重建而清零）',
+        viewer.g.wheelSwipe.locked === true && viewer.g.wheelSwipe.lockedAt > 0,
+        `locked=${viewer.g.wheelSwipe.locked}`
+      );
+
+      // 17.2e 尾巴跨过切换动画的那 300ms：动画期间 enabled=false，
+      //       若那段时间完全不记账，tail 的时间戳就不会更新 —— 等动画一结束，
+      //       同一串尾巴会被误判成「已经停息过」，于是又能攒够一次位移。
+      //       这正是「一次轻甩连翻好几张」最难发现的一处：肉眼只看到翻，
+      //       看不出是跨过了动画才翻的。
+      //       探针里切换动画被 animate 替身压缩到了几十毫秒，所以这里手动把
+      //       enabled 关掉，把那 300ms 还原出来。
+      // 17.2e 切换动画那 300ms（enabled=false）里到来的 wheel 也要记账：
+      //       否则那段时间的时间戳不推进、横向也不被认领，等动画一结束同一串
+      //       尾巴会被当成「早停息过」，白白多出一个可翻页的窗口。
+      //       探针里切换动画被 animate 替身压缩到几十毫秒，这里手动把那段时间
+      //       还原出来。
+      await twOpen(1);
+      wheel({ deltaX: 30, deltaY: 0 });
+      await awaitGo();
+      viewer.g.enabled = false;
+      const atBefore = viewer.g.wheelSwipe.at;
+      const tailInAnim = [];
+      for (const d of [22, 18, 14, 12]) {
+        await sleep(60);
+        tailInAnim.push(wheel({ deltaX: d, deltaY: 0 }));
+      }
+      viewer.g.enabled = true;
+      ok(
+        '17.2e 转场期间（enabled=false）横向依旧被认领',
+        tailInAnim.every((ev) => ev.defaultPrevented === true),
+        tailInAnim.map((ev) => ev.defaultPrevented).join(',')
+      );
+      ok(
+        '17.2e 转场期间尾巴仍推进时间戳（同一手势不会被切成两截）',
+        viewer.g.wheelSwipe.at > atBefore,
+        `${Math.round(atBefore)} → ${Math.round(viewer.g.wheelSwipe.at)}`
+      );
+      for (const d of [16, 16]) {
+        await sleep(60);
+        wheel({ deltaX: d, deltaY: 0 });
+      }
+      await awaitGo();
+      ok(
+        '17.2e 尾巴跨过切图动画也不连翻',
+        viewer.index === 2,
+        String(viewer.index)
+      );
+      ok(
+        '17.2e 尾巴跨过切图动画（enabled=false 那段）也不连翻',
+        viewer.index === 2,
+        String(viewer.index)
+      );
+
+      // 17.2f 尾巴停息之后用户再推一次 → 应该允许下一次切换
+      await sleep(260);
+      wheel({ deltaX: 30, deltaY: 0 });
+      await awaitGo();
+      ok(
+        '17.2f 尾巴停息后重新滑动 → 再翻一张',
+        viewer.index === 3,
+        String(viewer.index)
+      );
+
+      // 17.3 反向 → 上一张
+      await twOpen(3);
+      wheel({ deltaX: -24, deltaY: 0 });
+      await awaitGo();
+      ok('17.3 反方向滑动切回上一张', viewer.index === 2, String(viewer.index));
+
+      // 17.4 纵向主导必须是缩放（不能一边缩放一边翻页）
+      await twOpen(2);
+      const beforeAxis = viewer.index;
+      // deltaY > 0 在「自然滚动」开启的机器上是内容向上、也就是手指向上 ·
+      // 与其它入口一致的惯例是：手指向上 = 放大
+      wheel({ deltaX: 10, deltaY: 60 });
+      await sleep(20);
+      ok(
+        '17.4a 纵向主导 → 走缩放（手指向上 = 放大）',
+        viewer.g.scale > 1.05,
+        viewer.g.scale.toFixed(3)
+      );
+      ok('17.4b 纵向主导不翻页', viewer.index === beforeAxis, String(viewer.index));
+
+      // 17.5 已放大 → 横向是平移，不是翻页
+      await twOpen(2);
+      await viewer.g.zoomTo(2, { x: 0, y: 0 }, false);
+      const panBefore = viewer.g.rawX;
+      wheel({ deltaX: 30, deltaY: 0 });
+      await sleep(20);
+      ok(
+        '17.5a 放大态下横向 wheel 平移画面（内容跟着滑动方向走）',
+        Math.abs(viewer.g.rawX - (panBefore - 30)) < 1,
+        `${panBefore.toFixed(1)} → ${viewer.g.rawX.toFixed(1)}，期望 ${(panBefore - 30).toFixed(1)}`
+      );
+      ok('17.5b 放大态下横向 wheel 不翻页', viewer.index === 2, String(viewer.index));
+
+      // 17.6 到首尾：给回弹而不是静默吞掉
+      await twOpen(0);
+      clearAnimations();
+      wheel({ deltaX: -24, deltaY: 0 });
+      await awaitGo();
+      ok('17.6a 第一张继续往前不切图', viewer.index === 0, String(viewer.index));
+      await sleep(80);
+      ok(
+        '17.6b 到头时有回弹反馈（不是毫无动静）',
+        lastOf(viewer.track) !== null,
+        String(lastOf(viewer.track)?.options?.duration)
+      );
+
+      // 17.7 右边缘留给 macOS 通知中心
+      await twOpen(2);
+      wheel({ deltaX: 40, deltaY: 0, clientX: window.innerWidth - 8 });
+      wheel({ deltaX: 40, deltaY: 0, clientX: window.innerWidth - 8 });
+      await awaitGo();
+      ok(
+        '17.7 右边缘起手不切图（让给通知中心）',
+        viewer.index === 2,
+        String(viewer.index)
+      );
+
+      // 17.8 捏合（ctrl+wheel）与横滑互斥
+      await twOpen(2);
+      wheel({ deltaX: 40, deltaY: 0, ctrlKey: true });
+      await awaitGo();
+      ok('17.8 捏合期间不切图', viewer.index === 2, String(viewer.index));
+
+      // 17.9 方向与 macOS「滚动方向：自然」开关无关：
+      //      同一个 +24 在两种设置下代表的物理手势是相反的，归一化之后
+      //      「手指向左」必须都落到「下一张」。这曾经反过：写反了符号。
+      await twOpen(2);
+      const raw = new WheelEvent('wheel', {
+        bubbles: true,
+        cancelable: true,
+        // 不定义 webkitDirectionInvertedFromDevice —— 模拟「自然滚动」已关闭
+        // 的机器（本机正是如此：com.apple.swipescrolldirection = 1）
+        deltaX: 24,
+        deltaY: 0,
+        clientX: startX,
+        clientY: startY
+      });
+      viewer.track.dispatchEvent(raw);
+      await awaitGo();
+      ok(
+        '17.9a 自然滚动关闭时 +24 = 手指向右 = 上一张',
+        viewer.index === 1,
+        String(viewer.index)
+      );
+
+      await twOpen(2);
+      wheel({ deltaX: 24, deltaY: 0 }); // helper 补了 inverted=true
+      await awaitGo();
+      ok(
+        '17.9b 自然滚动开启时 +24 = 手指向左 = 下一张',
+        viewer.index === 3,
+        String(viewer.index)
+      );
+
+      // 17.10 胶片条不在 wheel 的作用域里：那里的横向语义是滚缩略图
+      await twOpen(2);
+      const trackBox = viewer.track.getBoundingClientRect();
+      const stripBox = viewer.strip.root.getBoundingClientRect();
+      ok(
+        '17.10a 胶片条不在 track 内（wheel 监听收不到它的事件）',
+        viewer.track.contains(viewer.strip.root) === false
+      );
+      ok(
+        '17.10b 胶片条与轨道区域不重叠',
+        stripBox.top >= trackBox.bottom - 1,
+        `strip.top=${Math.round(stripBox.top)} track.bottom=${Math.round(trackBox.bottom)}`
+      );
+
+      // 17.11 只有一张图时横向毫无意义：既不切图，也不给（会把黑边拉出来的）回弹
+      viewer.setItems([items[2]]);
+      await twOpen(0);
+      clearAnimations();
+      wheel({ deltaX: 40, deltaY: 0 });
+      wheel({ deltaX: 40, deltaY: 0 });
+      await awaitGo();
+      await sleep(80);
+      ok('17.11a 单图时横向不切图', viewer.index === 0, String(viewer.index));
+      ok(
+        '17.11b 单图时不给回弹（邻槽是空的，回弹会把黑边拉出来）',
+        lastOf(viewer.track) === null,
+        String(lastOf(viewer.track)?.options?.duration)
+      );
+      viewer.setItems(items);
+      await viewer.close();
+
       } catch (error) {
         log.push(`THREW ${error && error.stack ? error.stack.split('\n')[0] : String(error)}`);
       }
