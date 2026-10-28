@@ -1301,117 +1301,172 @@
         await sleep(20);
       };
 
-      // 17.1 纯横向轻扫 → 下一张
-      await twOpen(2);
-      const evIdle = wheel({ deltaX: 3, deltaY: 0 });
-      ok('17.1a 还在阈值内时不消费（默认行为不被阻断）', evIdle.defaultPrevented === false);
-      ok('17.1b 小幅噪点不翻页', viewer.index === 2, String(viewer.index));
-      const evFire = wheel({ deltaX: 24, deltaY: 0 });
-      await awaitGo();
-      ok('17.1c 越过阈值后切到下一张', viewer.index === 3, String(viewer.index));
-      ok('17.1d 真正翻页时才 preventDefault', evFire.defaultPrevented === true);
+      /**
+       * 一次典型的触控板轻甩：起手加速 → 抬手后的惯性尾巴（合计 ~285px）。
+       * 全程 16ms 一帧，中间没有任何静默 —— 对状态机来说这就是「一整段流」。
+       */
+      const flickDeltas = [4, 9, 16, 24, 30, 34, 32, 28, 24, 20, 16, 13, 10, 8, 6, 4, 3, 2, 1];
+      const swipeOnce = async (sign = -1, gap = 16) => {
+        for (const d of flickDeltas) {
+          await sleep(gap);
+          wheel({ deltaX: sign * d, deltaY: 0 });
+        }
+      };
+      /**
+       * 慢拖：40ms 一帧、每帧 6~20px（≈0.2px/ms，远低于「甩」的 0.45）。
+       * 这种节奏下不该提前结算，画面要一路跟着手走 —— 跟手度就在这里量。
+       */
+      const slowDrag = async (deltas, gap = 40) => {
+        for (const d of deltas) {
+          await sleep(gap);
+          wheel({ deltaX: d, deltaY: 0 });
+        }
+      };
+      /** 等「流停 → 结算」：结算窗口 65ms + 收尾动画 */
+      const settle = async (ms = 200) => {
+        await sleep(ms);
+        await awaitGo();
+      };
 
-      // 17.1e 累积是跨事件的：单个 10px 不够（越过 8px 死区后只剩 2），
-      //       两个 10px 才够 —— 这条同时守「重置后仍拿着旧引用」的写法
+      // 17.1 跟手：慢拖时画面逐帧跟着手走，松手时才收尾
       await twOpen(2);
-      wheel({ deltaX: 10, deltaY: 0 });
-      await awaitGo();
-      ok('17.1e 单个小幅 wheel 不翻页', viewer.index === 2, String(viewer.index));
-      wheel({ deltaX: 10, deltaY: 0 });
-      await awaitGo();
-      ok('17.1f 位移跨事件累加到阈值后才翻页', viewer.index === 3, String(viewer.index));
-
-      // 17.2 一次手势只翻一张：抬手后的惯性尾巴必须整串被吞掉
-      await twOpen(1);
-      // macOS 的典型尾巴：幅度单调衰减、间隔十几毫秒，且总长远超切换动画
-      const tail = [26, 22, 18, 14, 11, 9, 7, 5, 4, 3, 2, 1];
-      wheel({ deltaX: 30, deltaY: 0 });
-      await awaitGo();
-      ok('17.2a 越过阈值触发一次切换', viewer.index === 2, String(viewer.index));
+      const base17 = viewer.index;
+      await sleep(16);
+      const evTiny = wheel({ deltaX: 3, deltaY: 0 });
       ok(
-        '17.2b 触发后立刻落锁（不是等回调回来再补保险）',
+        '17.1a 死区内的噪点既不跟手也不消费（默认行为不被阻断）',
+        viewer.g.swipeX === 0 && evTiny.defaultPrevented === false,
+        `swipeX=${viewer.g.swipeX} prevented=${evTiny.defaultPrevented}`
+      );
+
+      // 17.1b 跟手度：逐事件比对「轨道位移 vs 累计手势位移」
+      // 先把上一段那一下 +3px 的噪声清掉（否则它会并进同一段手势的累积里，
+      // 让「跟手度」这条断言凭空多出 3px 误差）
+      viewer.g.resetWheelSwipe();
+      let acc = 0;
+      let worst = 0;
+      const samples = [];
+      for (const d of [6, 7, 8, 9, 10, 11]) {
+        await sleep(40);
+        wheel({ deltaX: d, deltaY: 0 });
+        acc -= d; // 探针的 deltaX 为正 = 手指向左 = 内部 dx 为负
+        if (Math.abs(acc) > 8) {
+          worst = Math.max(worst, Math.abs(viewer.g.swipeX - acc));
+          samples.push(`${acc}:${Math.round(viewer.g.swipeX)}`);
+        }
+      }
+      ok(
+        '17.1b 跟手度：每个事件的轨道位移都等于累计手势位移（误差 < 1px）',
+        worst < 1,
+        `最大误差 ${worst.toFixed(2)}px ${samples.join(' ')}`
+      );
+
+      await sleep(40); // 与上一帧一样的节奏，否则会被算成「同帧内的第二个事件」
+      const evFollow = wheel({ deltaX: 12, deltaY: 0 });
+      ok('17.1c 跟手的那几帧就已经 preventDefault', evFollow.defaultPrevented === true);
+      ok('17.1d 这一段还没停 → 不结算', viewer.index === base17, String(viewer.index));
+
+      await settle();
+      ok(
+        '17.1e 位移不够（≈63px）：松手回弹，不翻页',
+        viewer.index === base17 && viewer.g.swipeX === 0,
+        `index=${viewer.index} swipeX=${viewer.g.swipeX}`
+      );
+
+      // 17.1f 甩：一段流还没停就该切图（不等静默窗口 = 不迟钝）
+      await twOpen(2);
+      const quickBefore = viewer.index;
+      for (let i = 0; i < 4; i += 1) {
+        await sleep(16);
+        wheel({ deltaX: 40, deltaY: 0 });
+      }
+      ok(
+        '17.1f 甩到门槛就在流里切图（不陪惯性尾巴耗时间）',
+        viewer.index === quickBefore + 1,
+        `${quickBefore} → ${viewer.index}`
+      );
+      await settle();
+
+      // 17.1g 起手噪声不能把整段横滑钉成缩放（「第一次滑不动」的真因）
+      await twOpen(2);
+      const noiseBefore = viewer.index;
+      await sleep(16);
+      wheel({ deltaX: 3, deltaY: 4 }); // 起手那两帧：纵向略大
+      await sleep(16);
+      wheel({ deltaX: 4, deltaY: 3 });
+      for (const d of [20, 30, 40]) {
+        await sleep(16);
+        wheel({ deltaX: d, deltaY: 0 });
+      }
+      await settle();
+      ok(
+        '17.1g 起手噪声（dx=3/dy=4）不会把整段横滑误判成缩放',
+        viewer.index === noiseBefore + 1 && Math.abs(viewer.g.scale - 1) < 0.02,
+        `index ${noiseBefore} → ${viewer.index}，scale=${viewer.g.scale.toFixed(3)}`
+      );
+
+      // 17.2 一次手势只翻一张：推得再远也不连翻（上一版连翻的回归用例）
+      await twOpen(1);
+      const longBefore = viewer.index;
+      for (let i = 0; i < 40; i += 1) {
+        await sleep(16);
+        wheel({ deltaX: 25, deltaY: 0 }); // 推的阶段：每帧 25px，连推 40 帧
+      }
+      for (const d of [22, 19, 16, 13, 10, 8, 6, 4, 3, 2]) {
+        await sleep(16);
+        wheel({ deltaX: d, deltaY: 0 });
+      }
+      ok(
+        '17.2a 一次长距离横滑（推 + 惯性尾巴）只翻一张',
+        viewer.index === longBefore + 1,
+        `${longBefore} → ${viewer.index}`
+      );
+      ok(
+        '17.2b 结算之后落锁（同一段不再重来）',
         viewer.g.wheelSwipe.locked === true,
         String(viewer.g.wheelSwipe.locked)
       );
-      for (const d of tail) wheel({ deltaX: d, deltaY: 0 });
-      await awaitGo();
-      ok(
-        '17.2c 同一串 wheel 的衰减尾巴不会连翻（一次一张）',
-        viewer.index === 2,
-        String(viewer.index)
-      );
-      ok(
-        '17.2d 锁定状态跨实例交接（不随 Gestures 重建而清零）',
-        viewer.g.wheelSwipe.locked === true && viewer.g.wheelSwipe.lockedAt > 0,
-        `locked=${viewer.g.wheelSwipe.locked}`
-      );
 
-      // 17.2e 尾巴跨过切换动画的那 300ms：动画期间 enabled=false，
-      //       若那段时间完全不记账，tail 的时间戳就不会更新 —— 等动画一结束，
-      //       同一串尾巴会被误判成「已经停息过」，于是又能攒够一次位移。
-      //       这正是「一次轻甩连翻好几张」最难发现的一处：肉眼只看到翻，
-      //       看不出是跨过了动画才翻的。
-      //       探针里切换动画被 animate 替身压缩到了几十毫秒，所以这里手动把
-      //       enabled 关掉，把那 300ms 还原出来。
-      // 17.2e 切换动画那 300ms（enabled=false）里到来的 wheel 也要记账：
-      //       否则那段时间的时间戳不推进、横向也不被认领，等动画一结束同一串
-      //       尾巴会被当成「早停息过」，白白多出一个可翻页的窗口。
-      //       探针里切换动画被 animate 替身压缩到几十毫秒，这里手动把那段时间
-      //       还原出来。
-      await twOpen(1);
-      wheel({ deltaX: 30, deltaY: 0 });
-      await awaitGo();
-      viewer.g.enabled = false;
-      const atBefore = viewer.g.wheelSwipe.at;
-      const tailInAnim = [];
-      for (const d of [22, 18, 14, 12]) {
-        await sleep(60);
-        tailInAnim.push(wheel({ deltaX: d, deltaY: 0 }));
+      // 17.2c 同一段还没停（中间没有静默）就继续堆位移，也不会多给一张
+      for (let i = 0; i < 10; i += 1) {
+        await sleep(16);
+        wheel({ deltaX: 25, deltaY: 0 });
       }
+      ok(
+        '17.2c 同一段里继续堆位移不连翻',
+        viewer.index === longBefore + 1,
+        `${longBefore} → ${viewer.index}`
+      );
+      await settle(400);
+
+      // 17.3 抬手（静默）之后再滑：必须立刻还能翻 —— 「不灵敏」的回归点
+      const chainBefore = viewer.index;
+      await swipeOnce(1);
+      await settle();
+      ok('17.3a 抬手后再滑立刻翻一张', viewer.index === chainBefore + 1, `${chainBefore} → ${viewer.index}`);
+      const chain2 = viewer.index;
+      await swipeOnce(1);
+      await settle();
+      ok('17.3b 连着第二下同样响应', viewer.index === chain2 + 1, `${chain2} → ${viewer.index}`);
+
+      // 17.4 结算撞上切图动画（enabled=false）：要等动画跑完，不能把这一下丢掉
+      await twOpen(2);
+      const busyIdx = viewer.index;
+      viewer.g.enabled = false; // 复现「结算时切换动画还在跑」
+      await slowDrag(new Array(17).fill(20)); // 340px > 22% × 视口
+      await sleep(120);
+      ok('17.4a 动画没跑完时先不结算', viewer.index === busyIdx, String(viewer.index));
       viewer.g.enabled = true;
-      ok(
-        '17.2e 转场期间（enabled=false）横向依旧被认领',
-        tailInAnim.every((ev) => ev.defaultPrevented === true),
-        tailInAnim.map((ev) => ev.defaultPrevented).join(',')
-      );
-      ok(
-        '17.2e 转场期间尾巴仍推进时间戳（同一手势不会被切成两截）',
-        viewer.g.wheelSwipe.at > atBefore,
-        `${Math.round(atBefore)} → ${Math.round(viewer.g.wheelSwipe.at)}`
-      );
-      for (const d of [16, 16]) {
-        await sleep(60);
-        wheel({ deltaX: d, deltaY: 0 });
-      }
-      await awaitGo();
-      ok(
-        '17.2e 尾巴跨过切图动画也不连翻',
-        viewer.index === 2,
-        String(viewer.index)
-      );
-      ok(
-        '17.2e 尾巴跨过切图动画（enabled=false 那段）也不连翻',
-        viewer.index === 2,
-        String(viewer.index)
-      );
+      await settle(240);
+      ok('17.4b 动画一结束就补上这一次（输入没丢）', viewer.index === busyIdx + 1, String(viewer.index));
 
-      // 17.2f 尾巴停息之后用户再推一次 → 应该允许下一次切换
-      await sleep(260);
-      wheel({ deltaX: 30, deltaY: 0 });
-      await awaitGo();
-      ok(
-        '17.2f 尾巴停息后重新滑动 → 再翻一张',
-        viewer.index === 3,
-        String(viewer.index)
-      );
-
-      // 17.3 反向 → 上一张
+      // 17.5 反方向 → 上一张
       await twOpen(3);
-      wheel({ deltaX: -24, deltaY: 0 });
-      await awaitGo();
-      ok('17.3 反方向滑动切回上一张', viewer.index === 2, String(viewer.index));
+      await swipeOnce(-1);
+      await settle();
+      ok('17.5 反方向滑动切回上一张', viewer.index === 2, String(viewer.index));
 
-      // 17.4 纵向主导必须是缩放（不能一边缩放一边翻页）
+      // 17.6 纵向主导必须是缩放（不能一边缩放一边翻页）
       await twOpen(2);
       const beforeAxis = viewer.index;
       // deltaY > 0 在「自然滚动」开启的机器上是内容向上、也就是手指向上 ·
@@ -1419,56 +1474,56 @@
       wheel({ deltaX: 10, deltaY: 60 });
       await sleep(20);
       ok(
-        '17.4a 纵向主导 → 走缩放（手指向上 = 放大）',
+        '17.6a 纵向主导 → 走缩放（手指向上 = 放大）',
         viewer.g.scale > 1.05,
         viewer.g.scale.toFixed(3)
       );
-      ok('17.4b 纵向主导不翻页', viewer.index === beforeAxis, String(viewer.index));
+      ok('17.6b 纵向主导不翻页', viewer.index === beforeAxis, String(viewer.index));
 
-      // 17.5 已放大 → 横向是平移，不是翻页
+      // 17.7 已放大 → 横向是平移，不是翻页
       await twOpen(2);
       await viewer.g.zoomTo(2, { x: 0, y: 0 }, false);
       const panBefore = viewer.g.rawX;
       wheel({ deltaX: 30, deltaY: 0 });
       await sleep(20);
       ok(
-        '17.5a 放大态下横向 wheel 平移画面（内容跟着滑动方向走）',
+        '17.7a 放大态下横向 wheel 平移画面（内容跟着滑动方向走）',
         Math.abs(viewer.g.rawX - (panBefore - 30)) < 1,
         `${panBefore.toFixed(1)} → ${viewer.g.rawX.toFixed(1)}，期望 ${(panBefore - 30).toFixed(1)}`
       );
-      ok('17.5b 放大态下横向 wheel 不翻页', viewer.index === 2, String(viewer.index));
+      ok('17.7b 放大态下横向 wheel 不翻页', viewer.index === 2, String(viewer.index));
 
-      // 17.6 到首尾：给回弹而不是静默吞掉
+      // 17.8 到首尾：给回弹而不是静默吞掉
       await twOpen(0);
       clearAnimations();
-      wheel({ deltaX: -24, deltaY: 0 });
-      await awaitGo();
-      ok('17.6a 第一张继续往前不切图', viewer.index === 0, String(viewer.index));
+      await swipeOnce(-1);
+      await settle(300);
+      ok('17.8a 第一张继续往前不切图', viewer.index === 0, String(viewer.index));
       await sleep(80);
       ok(
-        '17.6b 到头时有回弹反馈（不是毫无动静）',
+        '17.8b 到头时有回弹反馈（不是毫无动静）',
         lastOf(viewer.track) !== null,
         String(lastOf(viewer.track)?.options?.duration)
       );
 
-      // 17.7 右边缘留给 macOS 通知中心
+      // 17.9 右边缘留给 macOS 通知中心
       await twOpen(2);
       wheel({ deltaX: 40, deltaY: 0, clientX: window.innerWidth - 8 });
       wheel({ deltaX: 40, deltaY: 0, clientX: window.innerWidth - 8 });
-      await awaitGo();
+      await settle(300);
       ok(
-        '17.7 右边缘起手不切图（让给通知中心）',
+        '17.9 右边缘起手不切图（让给通知中心）',
         viewer.index === 2,
         String(viewer.index)
       );
 
-      // 17.8 捏合（ctrl+wheel）与横滑互斥
+      // 17.10 捏合（ctrl+wheel）与横滑互斥
       await twOpen(2);
       wheel({ deltaX: 40, deltaY: 0, ctrlKey: true });
-      await awaitGo();
-      ok('17.8 捏合期间不切图', viewer.index === 2, String(viewer.index));
+      await settle(300);
+      ok('17.10 捏合期间不切图', viewer.index === 2, String(viewer.index));
 
-      // 17.9 方向与 macOS「滚动方向：自然」开关无关：
+      // 17.11 方向与 macOS「滚动方向：自然」开关无关：
       //      同一个 +24 在两种设置下代表的物理手势是相反的，归一化之后
       //      「手指向左」必须都落到「下一张」。这曾经反过：写反了符号。
       await twOpen(2);
@@ -1482,52 +1537,179 @@
         clientX: startX,
         clientY: startY
       });
+      await sleep(16);
       viewer.track.dispatchEvent(raw);
-      await awaitGo();
+      await sleep(16);
+      viewer.track.dispatchEvent(new WheelEvent('wheel', {
+        bubbles: true, cancelable: true, deltaX: 40, deltaY: 0, clientX: startX, clientY: startY
+      }));
+      await sleep(16);
+      viewer.track.dispatchEvent(new WheelEvent('wheel', {
+        bubbles: true, cancelable: true, deltaX: 44, deltaY: 0, clientX: startX, clientY: startY
+      }));
+      await settle(300);
       ok(
-        '17.9a 自然滚动关闭时 +24 = 手指向右 = 上一张',
+        '17.11a 自然滚动关闭时向左划 = 上一张',
         viewer.index === 1,
         String(viewer.index)
       );
 
       await twOpen(2);
-      wheel({ deltaX: 24, deltaY: 0 }); // helper 补了 inverted=true
-      await awaitGo();
+      await swipeOnce(1);
+      await settle();
       ok(
-        '17.9b 自然滚动开启时 +24 = 手指向左 = 下一张',
+        '17.11b 自然滚动开启时向左划 = 下一张',
         viewer.index === 3,
         String(viewer.index)
       );
 
-      // 17.10 胶片条不在 wheel 的作用域里：那里的横向语义是滚缩略图
+      // 17.12 胶片条不在 wheel 的作用域里：那里的横向语义是滚缩略图
       await twOpen(2);
       const trackBox = viewer.track.getBoundingClientRect();
       const stripBox = viewer.strip.root.getBoundingClientRect();
       ok(
-        '17.10a 胶片条不在 track 内（wheel 监听收不到它的事件）',
+        '17.12a 胶片条不在 track 内（wheel 监听收不到它的事件）',
         viewer.track.contains(viewer.strip.root) === false
       );
       ok(
-        '17.10b 胶片条与轨道区域不重叠',
+        '17.12b 胶片条与轨道区域不重叠',
         stripBox.top >= trackBox.bottom - 1,
         `strip.top=${Math.round(stripBox.top)} track.bottom=${Math.round(trackBox.bottom)}`
       );
 
-      // 17.11 只有一张图时横向毫无意义：既不切图，也不给（会把黑边拉出来的）回弹
+      // 17.13 只有一张图时横向毫无意义：既不切图，也不给（会把黑边拉出来的）回弹
       viewer.setItems([items[2]]);
       await twOpen(0);
       clearAnimations();
-      wheel({ deltaX: 40, deltaY: 0 });
-      wheel({ deltaX: 40, deltaY: 0 });
-      await awaitGo();
+      await swipeOnce(-1);
+      await settle(300);
       await sleep(80);
-      ok('17.11a 单图时横向不切图', viewer.index === 0, String(viewer.index));
+      ok('17.13a 单图时横向不切图', viewer.index === 0, String(viewer.index));
       ok(
-        '17.11b 单图时不给回弹（邻槽是空的，回弹会把黑边拉出来）',
+        '17.13b 单图时不给回弹（邻槽是空的，回弹会把黑边拉出来）',
         lastOf(viewer.track) === null,
         String(lastOf(viewer.track)?.options?.duration)
       );
+      ok('17.13c 单图时也不跟手', viewer.g.swipeX === 0, String(viewer.g.swipeX));
       viewer.setItems(items);
+
+      // 17.14 连续切换之后不跟手的真因：**上一次的收尾动画还在跑**。
+      //      切图的收尾动画跑在 track 上（WAAPI），关键帧优先级高于内联样式：
+      //      动画没播完时手势写进 style.transform 的那笔位移是看不见的，要等
+      //      动画结束才突然生效 —— 表现为「按下去不动，过一下才跳过去」。
+      //      探针里的 animate 替身是「立即完成」的，所以要手工造出动画跑到
+      //      一半的现场（真机上这才是连续快切时的常态）。
+      const visualX = (el) => {
+        const m = new DOMMatrixReadOnly(getComputedStyle(el).transform);
+        return Number.isFinite(m.m41) ? m.m41 : 0;
+      };
+
+      await twOpen(2);
+      const W17 = viewer.slotWidth();
+      const mid17 = -1.35 * W17; // 画面停在「两张图各露一部分」
+      viewer.switching = true; // go() 还没结束
+      viewer.g.enabled = false; // 动画期间的闸门
+      viewer.slotIndex = 2; // 目标槽已经从右边推进来
+      viewer.trackOffset = -2 * W17;
+      viewer.track.style.transform = `translate3d(${mid17}px, 0, 0)`;
+      let cancelled17 = false;
+      viewer.trackAnim = {
+        playState: 'running',
+        cancel() {
+          cancelled17 = true;
+        }
+      };
+
+      await sleep(16);
+      wheel({ deltaX: 40, deltaY: 0 }); // 只推 40px：远不够翻页
+      await sleep(16);
+      ok(
+        '17.14a 起手就接管（还在跑的收尾动画被取消）',
+        cancelled17 && viewer.trackAnim === null,
+        `cancelled=${cancelled17} trackAnim=${String(viewer.trackAnim)}`
+      );
+      ok(
+        '17.14b 接管后画面从刚才停的位置继续跟手（不跳、也不被关键帧盖住）',
+        Math.abs(visualX(viewer.track) - (mid17 - 40)) < 2,
+        `视觉 ${visualX(viewer.track).toFixed(1)}，期望 ${(mid17 - 40).toFixed(1)}`
+      );
+      ok(
+        '17.14c 接管后立刻解除 switching / enabled（不必再等一次动画）',
+        viewer.switching === false && viewer.g.enabled === true,
+        `switching=${viewer.switching} enabled=${viewer.g.enabled}`
+      );
+      ok(
+        '17.14d 接管偏移不参与阈值（只推了 40px，不该结算）',
+        viewer.index === 2,
+        String(viewer.index)
+      );
+      await settle(300);
+
+      // 17.14e 连续三次「切到一半就再起手」：每一段都必须重新对齐。
+      //       每轮只推 12px（40ms 一帧）：低于「擦过 28px + 峰值速度」的结算
+      //       门槛，避免异步的 go() 插手，这样纯粹检验接管的视觉连续性。
+      await twOpen(1);
+      let drift17 = 0;
+      const trace17 = [];
+      for (let i = 0; i < 3; i += 1) {
+        const W = viewer.slotWidth();
+        const from = -(1.35 + i * 0.1) * W;
+        viewer.switching = true;
+        viewer.g.enabled = false;
+        viewer.slotIndex = 2;
+        viewer.trackOffset = -2 * W;
+        viewer.track.style.transform = `translate3d(${from}px, 0, 0)`;
+        viewer.trackAnim = { playState: 'running', cancel() {} };
+        await sleep(16);
+        wheel({ deltaX: 12, deltaY: 0 });
+        await sleep(40);
+        const got = visualX(viewer.track);
+        drift17 = Math.max(drift17, Math.abs(got - (from - 12)));
+        trace17.push(
+          `#${i} from=${from.toFixed(0)} got=${got.toFixed(0)} swipeX=${viewer.g.swipeX.toFixed(
+            0
+          )} base=${String(viewer.g.wheelSwipe.base)} off=${viewer.trackOffset.toFixed(0)} W=${W}`
+        );
+        await settle(300);
+      }
+      ok(
+        '17.14e 连续三次切图中起手，画面与手势始终对齐（误差 < 2px）',
+        drift17 < 2,
+        `最大误差 ${drift17.toFixed(2)}px｜${trace17.join('｜')}`
+      );
+
+      // 17.15 回弹被打断：必须接住回弹中途的那一截。
+      //       没达标的那一段会回弹 200ms；回弹是 WAAPI 关键帧，优先级高于内联
+      //       样式 —— 掐掉它的瞬间视觉会掉回内联值（= 0 偏移），那段没走完的
+      //       位移就整段消失了。探针里 animate 是「立刻完成」的替身，所以这里
+      //       手工把画面摆到回弹中途（真机上这就是「半滑回弹后又立刻再滑」）。
+      await twOpen(2);
+      const mid15 = -90; // 未达标的那一段推出去的位移
+      viewer.track.style.transform = `translate3d(${viewer.trackOffset + mid15}px, 0, 0)`;
+      let cancelled15 = false;
+      viewer.g.anim = {
+        cancel() {
+          cancelled15 = true;
+        }
+      };
+      const vis15before = visualX(viewer.track);
+      await sleep(16);
+      wheel({ deltaX: 30, deltaY: 0 }); // 回弹还没播完就再滑
+      await sleep(16);
+      ok('17.15a 打断回弹前先掐掉那个动画', cancelled15 === true, String(cancelled15));
+      ok(
+        '17.15b 从画面实际所在的位置接着跟手（不往回跳）',
+        Math.abs(visualX(viewer.track) - (vis15before - 30)) < 2,
+        `视觉 ${visualX(viewer.track).toFixed(1)}，期望 ${(vis15before - 30).toFixed(1)}`
+      );
+      ok(
+        '17.15c 接管偏移 = 回弹中途的位置（不是写死的 0）',
+        Math.abs(viewer.g.wheelSwipe.base - mid15) < 2,
+        String(viewer.g.wheelSwipe.base)
+      );
+      ok('17.15d 打断回弹本身不会误翻页', viewer.index === 2, String(viewer.index));
+      await settle(300);
+
       await viewer.close();
 
       } catch (error) {

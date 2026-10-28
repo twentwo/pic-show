@@ -13,9 +13,10 @@
     "test:tokens": "node tools/check_tokens.mjs",
     "test:boot": "node tools/check_boot.mjs",
     "test:trackpad": "node tools/check_trackpad.mjs",
+    "test:wheel": "node tools/check_wheel_swipe.mjs",
     "rust:check": "cd src-tauri && cargo check",
     "rust:test": "cd src-tauri && cargo test",
-    "check": "npm run rust:check && npm test && npm run test:methods && npm run test:tokens && npm run test:boot && npm run test:trackpad",
+    "check": "npm run rust:check && npm test && npm run test:methods && npm run test:tokens && npm run test:boot && npm run test:trackpad && npm run test:wheel",
     "probe": "node tools/probe_gallery.mjs"
   },
   "devDependencies": {

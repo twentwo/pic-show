@@ -172,7 +172,15 @@ export function preload(src, priority = 'low') {
     }
 
     const promise = new Promise((resolve) => {
-        img.onload = () => resolve(img);
+        img.onload = () => {
+            // 光「下载完」还不够：真正的位图解码发生在第一次绘制的那一刻，
+            // 一张 4K 原图能占住主线程十几毫秒 —— 正好卡在切图动画的第一帧，
+            // 看起来就是「切过去的瞬间顿一下」。这里显式 decode 一次把位图
+            // 提前准备好（decode 失败不影响流程，回退到原来的懒解码即可）。
+            const done = () => resolve(img);
+            if (typeof img.decode === 'function') img.decode().then(done, done);
+            else done();
+        };
         img.onerror = () => resolve(null);
     });
 

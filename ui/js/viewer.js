@@ -62,6 +62,14 @@ export const OPEN_MS = 340;
 const CLOSE_MS = 300;
 /** 左右切换：轨道位移时长 */
 const SWITCH_MS = 300;
+/**
+ * 横滑跟手之后收尾动画的最短时长。
+ *
+ * 收尾只需要补完「手指还没走完的那一段」：推了 200px 再翻页，剩余 100px 用
+ * 300ms 走完就显得黏；按剩余比例缩到 100ms 上下，观感是「顺着手指滑进去的」。
+ * 留 110ms 下限，剩余距离为 0 时也不会变成瞬移。
+ */
+const SWITCH_EXIT_MIN_MS = 110;
 /** 跳转到相隔很远的一张时用的淡入时长 */
 const JUMP_MS = 200;
 /** 到首尾回弹提示的幅度（px） */
@@ -121,6 +129,12 @@ export class Viewer {
     /** 轨道当前的基准偏移（px，负值） */
     this.trackOffset = 0;
     this.trackAnim = null;
+    /**
+     * 切换的世代号：每开一次 `go()` 自增。手势接管动画后会立刻允许新的切换，
+     * 于是旧那次 `go()` 的 `await` 可能在新切换开场之后才回来 —— 用它认领
+     * 「我还是不是当前那一次」，避免把新实例的闸门提前放开。
+     */
+    this.switchGen = 0;
     /** 尺寸变化合并用的帧句柄 */
     this._resizeRaf = 0;
 
@@ -465,6 +479,7 @@ export class Viewer {
     if (this.slotIndex !== 1) this.rebalance();
 
     this.switching = true;
+    const gen = ++this.switchGen;
 
     // 手指已经拖出去的那段位移，动画要从这里接着走
     const carried = fromSwipe ? this.g?.swipeX ?? 0 : 0;
@@ -495,7 +510,18 @@ export class Viewer {
     this.syncOrigin(target);
     this.bumpChrome();
 
-    await this.animateTrack(fromX, toX, SWITCH_MS);
+    // 收尾动画只补完剩下的那段距离 —— 跟手已经推掉大半时，固定 300ms 会让
+    // 「手指早就到那儿了、画面还在慢慢挪」的拖沓感非常明显。
+    // 键盘 / 按钮（carried = 0）的剩余距离恒为一屏，因此仍是完整的 SWITCH_MS。
+    const dist = Math.abs(toX - fromX);
+    const duration = fromSwipe
+      ? clamp((SWITCH_MS * dist) / Math.max(1, width), SWITCH_EXIT_MIN_MS, SWITCH_MS)
+      : SWITCH_MS;
+
+    await this.animateTrack(fromX, toX, duration);
+    // 这一格已经被手势接管（`claimTrack` 就地落位并把 switching 放回 false），
+    // 或者又开了新的一次切换 —— 都不要再动，否则会把新实例的闸门提前放开
+    if (gen !== this.switchGen) return;
     // DOM 轮转一格 + 基准偏移同步改回中间槽 —— 两者同一帧生效，画面不动
     this.rebalance();
     this.preloadNeighbors();
@@ -514,6 +540,7 @@ export class Viewer {
     }
 
     this.switching = true;
+    const gen = ++this.switchGen;
     if (this.g?.isZoomed) this.g.reset(false);
     if (this.g) this.g.swipeX = 0;
 
@@ -542,9 +569,55 @@ export class Viewer {
     this.bumpChrome();
 
     await new Promise((resolve) => setTimeout(resolve, JUMP_MS));
+    if (gen !== this.switchGen) return;
     this.rebalance();
     this.preloadNeighbors();
     this.switching = false;
+  }
+
+  /**
+   * 把正在跑的轨道切换动画就地结束，交给手势接管。
+   *
+   * 为什么必须接管：切换的收尾动画跑在 `track` 上（WAAPI 关键帧），而关键帧的
+   * 优先级**高于内联样式**。动画没播完时手势写进 `track.style.transform` 的
+   * 那笔位移是完全看不见的 —— 要等动画结束才突然生效。连续快切时用户几乎总是
+   * 在上一次的收尾里再次起手，于是每一段跟手都被吞掉，观感就是「连续切了几张
+   * 之后就不跟手、按下去要等一下才动」。
+   *
+   * 接管做三件事：
+   *   1. 读当前**视觉**位移（computed transform），取消动画 —— 视觉上停在原地；
+   *   2. 让这一格立即完成轮转（`rebalance`），基准回到中间槽 —— 否则槽位与
+   *      偏移对不上，后续 `go()` 会跳；
+   *   3. 把 `switching` / `enabled` 立刻放开 —— 新手势不必再等一次动画才结算。
+   *
+   * 返回的偏移交给手势当作「已经推到哪儿了」，它与随后的第一笔 `applyTrack`
+   * 相加正好等于刚才的视觉位置，所以接管那一帧不会跳。
+   *
+   * @returns {number|null} 相对中间槽基准的偏移；没有动画在跑时 null
+   */
+  claimTrack() {
+    const anim = this.trackAnim;
+    if (!anim || anim.playState !== 'running') return null;
+
+    // 动画的视觉当前位置。这一步会强制一次样式计算，但一段手势只发生一次，
+    // 且只在「上一次切换还没播完」时才会走到这里。
+    let visual = this.trackOffset;
+    try {
+      visual = new DOMMatrixReadOnly(getComputedStyle(this.track).transform).m41;
+    } catch {
+      /* 解析不出来就退回代码里的终值 */
+    }
+
+    anim.cancel();
+    this.trackAnim = null;
+
+    this.switching = false;
+    this.rebalance();
+    this.trackOffset = -this.slotWidth();
+    this.track.style.transform = `translate3d(${this.trackOffset}px, 0, 0)`;
+    if (this.g) this.g.enabled = true;
+
+    return visual - this.trackOffset;
   }
 
   /** 轨道位移：先把终值写进 inline style，动画 fill:'none'，收尾不闪回 */
@@ -765,9 +838,14 @@ export class Viewer {
   attachGestures() {
     const previous = this.g;
     this.g?.detach();
+    // 实例重建 = 这一格已经落位、轨道基准回到中间槽：接管偏移属于**旧基准**，
+    // 带过去会让下一次跟手整整错开一屏（键盘切换时尤其明显，那条路上没人清它）
+    if (previous?.wheelSwipe) previous.wheelSwipe.base = null;
     this.g = new Gestures(this.currentSlot, {
       track: this.track,
       trackBase: () => this.trackOffset,
+      // 收尾动画归 viewer 管，手势够不到它的句柄 —— 交给它「就地结束并接上」
+      claimTrack: () => this.claimTrack(),
       // 每次切换都会重建 Gestures，但「一次触控板横滑」是跨实例连续的物理
       // 手势 —— 累积与冷却必须交接过去，否则实例一换就重新累积，一次甩动会
       // 因为一路达标而连翻好几张
@@ -802,11 +880,14 @@ export class Viewer {
       onSwipeRelease: (direction) => {
         this.go(direction, { fromSwipe: true });
       },
-      // 触控板双指横滑：没有「手指已经拖出去的那段位移」要继承，走完整的
-      // 切换动画即可；已经到首尾时 go() 自己会给一下回弹，不必另铺一条路
-      onWheelSwipe: (direction) => {
-        this.go(direction);
+      // 触控板双指横滑：手势期间画面一直跟着手走（横向那条分支写 `swipeX`），
+      // 停下来的那一刻才到这里结算 —— 于是它与单指松手走同一条 `fromSwipe`
+      // 路径，从当前跟手位置接着把剩下的位移播完。
+      onWheelSwipe: (direction, opts = {}) => {
+        this.go(direction, { fromSwipe: true, ...opts });
       },
+      // 跟手一开始就把目标那张的原图取回来解码：切过去的第一帧不必等解码
+      onSwipeIntent: (direction) => this.prefetchNeighbor(direction),
       onTap: (x, y) => this.onTap(x, y),
       onDoubleTap: (x, y) => this.toggleZoom(x, y),
       onUserActivity: () => this.bumpChrome()
@@ -859,6 +940,19 @@ export class Viewer {
     if (!item || !slot) return;
     const src = fullUrl(item.id, maxEdgeFor(item));
     if (slot.__full.__want !== src) setSrc(slot.__full, src);
+  }
+
+  /**
+   * 横滑方向一确定就把目标那张的原图取回来（并解码）。
+   *
+   * `preloadNeighbors()` 是每次切完之后才排的；打开预览后立刻甩一下时，目标那张
+   * 可能还在路上，结算那帧刚好撞上解码，观感是「切过去先糊一下」。跟手阶段
+   * 主线程本来就是空的，这时提前取最划算。
+   */
+  prefetchNeighbor(direction) {
+    const item = this.items[this.index + direction];
+    if (!item) return;
+    preload(fullUrl(item.id, maxEdgeFor(item)), 'high');
   }
 
   /** 预取前后各一张的原图，让方向键切换几乎无等待 */
