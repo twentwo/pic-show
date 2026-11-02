@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>exit probe</title>
+    <link rel="stylesheet" href="./styles/app.css" />
+  </head>
+  <body>
+    <pre id="out">running</pre>
+    <script type="module">
+      const out = document.getElementById('out');
+      const log = [];
+      const ok = (name, cond, extra = '') => {
+        log.push(`${cond ? 'PASS' : 'FAIL'} ${name}${extra ? ' :: ' + extra : ''}`);
+        out.textContent = log.join('\n');
+      };
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      // 全程监听未捕获异常与未处理的 rejection：界面「看起来正常」但控制台
+      // 一直在报错，是这类异步收尾最容易留下的后遗症。
+      const errors = [];
+      window.addEventListener('error', (e) =>
+        errors.push(e.error?.stack || e.message)
+      );
+      window.addEventListener('unhandledrejection', (e) =>
+        errors.push(String(e.reason?.stack || e.reason))
+      );
+
+      /* ---- 1. 用真实的 viewer.html 结构 ----
+       * 预览现在住在自己的窗口里，所以退出这条链也必须在**那个页面**上跑，
+       * 而不是在图片墙的 index.html 上。
+       */
+      const html = await (await fetch('./viewer.html')).text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      for (const node of [...doc.body.children]) {
+        if (node.tagName === 'SCRIPT' || node.tagName === 'PRE') continue;
+        document.body.appendChild(node);
+      }
+
+      /* ---- 2. 假的 Tauri IPC：可控、可记录 ----
+       * 关键差别：不再有 `set_stage` / `window_stage`。退出这条链的终点是
+       * `close_viewer` —— 销毁预览窗口，并把「用户在看第几张」送回主窗口。
+       */
+      const calls = [];
+      let cbSeq = 0;
+      const cbs = new Map();
+      const ITEMS = Array.from({ length: 12 }, (_, i) => ({
+        id: `fake-${i}`,
+        name: `pic-${i}.jpg`,
+        width: 1600 + i * 60,
+        height: 900 + i * 20
+      }));
+      /** 当前会话是不是「打开方式」来的（immersive） */
+      let immersive = false;
+      /** 后端收到的会话请求（模拟 `open_viewer` 直接塞给预览） */
+      let pending = null;
+
+      const deliver = (session) => {
+        const cb = cbs.get('goto');
+        if (cb) queueMicrotask(() => cb({ payload: session }));
+      };
+
+      window.__TAURI_INTERNALS__ = {
+        invoke(cmd, args = {}) {
+          calls.push({ cmd, ...args });
+          switch (cmd) {
+            case 'viewer_listening':
+              return Promise.resolve(undefined);
+            case 'viewer_boot':
+              return Promise.resolve(pending);
+            case 'viewer_ready':
+              // 回报原点 + 内容区真实尺寸（物理像素）：后端现在把「视口长到
+              // 终态没有」的判定依据一并给出来，前端不必再拿 window.screen 猜
+              return Promise.resolve({
+                x: 0,
+                y: 0,
+                width: window.innerWidth * (window.devicePixelRatio || 1),
+                height: window.innerHeight * (window.devicePixelRatio || 1)
+              });
+            case 'focus_viewer':
+              return Promise.resolve(undefined);
+            case 'close_viewer':
+              return Promise.resolve(undefined);
+            case 'exit_app':
+              return Promise.resolve(undefined);
+            case 'log_error': {
+              // 前端把异常送到这里 —— 探针必须看得见，否则它们是静默的。
+              // `[focus]` 那几行是焦点诊断（刻意用同一条通道），不是故障。
+              const text = String(args.message);
+              if (!text.startsWith('[focus]')) errors.push(text);
+              return Promise.resolve(undefined);
+            }
+            case 'plugin:event|listen':
+              if (args.event === 'picshow://viewer-goto') {
+                cbs.set('goto', cbs.get(args.handler));
+              }
+              return Promise.resolve(1);
+            default:
+              return Promise.resolve(null);
+          }
+        },
+        transformCallback(cb) {
+          const id = ++cbSeq;
+          cbs.set(id, cb);
+          return id;
+        },
+        unregisterCallback(id) {
+          cbs.delete(id);
+        }
+      };
+
+      /* ---- 3. 动画替身：无头环境拿不到合成帧 ---- */
+      Element.prototype.animate = function () {
+        return { finished: Promise.resolve(), cancel() {}, finish() {} };
+      };
+
+      /* ---- 3.5 这个环境里 rAF 出不出帧？（只报告，不断言） ----
+       * 无头 + 虚拟时间下 rAF 常常完全不回调。这恰好等价于真机上「窗口在全屏
+       * 转场、被最小化、被切到另一个 Space」时渲染帧停摆的情形 —— 那正是
+       * 「退出后卡死」的触发条件。所以这里不断言，只把它记下来：下面每一条
+       * 「退出后预览层收起」都是在帧停摆的前提下跑出来的。
+       */
+      let earlyFrames = 0;
+      {
+        let n = 0;
+        const t = () => {
+          n += 1;
+          if (n < 40) requestAnimationFrame(t);
+        };
+        requestAnimationFrame(t);
+        await sleep(600);
+        earlyFrames = n;
+      }
+      ok(
+        `[环境] rAF 是否回调: ${earlyFrames ? '是' : '否（等价于真机帧停摆，下面的断言更严格）'}`,
+        true
+      );
+
+      /** 一次会话：模拟后端把会话递给预览（冷启动走 boot，已跑时走 goto） */
+      const SESSION = () => ({
+        items: ITEMS,
+        index: 0,
+        source: 'probe',
+        immersive,
+        origin: null
+      });
+
+      try {
+        // 冷启动时会话已经在后端等着了（模拟 viewer_boot 取到）
+        pending = SESSION();
+        await import('./js/viewer-main.js');
+        await sleep(300);
+
+        const viewerEl = document.getElementById('viewer');
+
+        const esc = () =>
+          window.dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+          );
+        /** 轮询等一个条件（返回等到没有），避免用固定 sleep 掩盖「慢 vs 卡」 */
+        const settle = async (predicate, budget = 5000) => {
+          let w = 0;
+          while (!predicate() && w < budget) {
+            await sleep(100);
+            w += 100;
+          }
+          return w;
+        };
+        const reallyOpen = () =>
+          viewerEl.hidden === false &&
+          !viewerEl.classList.contains('is-priming');
+        const closed = () => viewerEl.hidden === true;
+        const closeCalls = () => calls.filter((c) => c.cmd === 'close_viewer');
+        const open = async () => {
+          pending = null;
+          deliver(SESSION());
+          return settle(reallyOpen, 4000);
+        };
+
+        // 轮询而不是固定 sleep：切全屏那串 await 要多久取决于设备，固定等待
+        // 会把「慢」误判成「打不开」。
+        const bootWait = await settle(reallyOpen, 4000);
+        ok(
+          '冷启动拿到会话 → 预览自己打开',
+          reallyOpen(),
+          `等待=${bootWait}ms priming=${viewerEl.classList.contains('is-priming')}`
+        );
+        ok(
+          '冷启动这条没有请求过主窗口的任何动作（预览是独立窗口）',
+          !calls.some((c) => ['set_stage', 'window_stage', 'showWindow'].includes(c.cmd)),
+          calls.map((c) => c.cmd).join(',')
+        );
+        {
+          // 收掉它，好让后面的三种退出方式各自从「待命」开始
+          esc();
+          await settle(closed, 4000);
+        }
+
+        /* ---- 4. 三种退出方式 × 多次进出 ---- */
+        const ways = [
+          { name: 'ESC', run: esc },
+          {
+            name: '关闭按钮',
+            run: () => document.querySelector('.viewer-close').click()
+          },
+          {
+            name: '点空白（背景层）',
+            run: () => document.querySelector('.viewer-backdrop').click()
+          }
+        ];
+
+        for (const way of ways) {
+          for (let round = 1; round <= 3; round += 1) {
+            const before = document.querySelectorAll('*').length;
+            const closesBefore = closeCalls().length;
+            await open();
+            ok(`${way.name} 第${round}次：会话到达后能进预览`, reallyOpen(),
+              `priming=${viewerEl.classList.contains('is-priming')}`);
+            if (!reallyOpen()) break;
+
+            way.run();
+            const waited = await settle(closed);
+            ok(
+              `${way.name} 第${round}次：退出后预览层收起`,
+              closed(),
+              `hidden=${viewerEl.hidden} 等待=${waited}ms`
+            );
+            ok(
+              `${way.name} 第${round}次：退出后幕布类已清`,
+              !viewerEl.classList.contains('is-priming'),
+              viewerEl.className
+            );
+            // 新的终点：预览让位，并把「在看第几张」送回主窗口
+            ok(
+              `${way.name} 第${round}次：退出时正好发一次 close_viewer`,
+              closeCalls().length === closesBefore + 1,
+              `close_viewer=${closeCalls().length}`
+            );
+            const after = document.querySelectorAll('*').length;
+            ok(
+              `${way.name} 第${round}次：DOM 节点没有累积`,
+              after <= before + 40,
+              `${before} → ${after}`
+            );
+          }
+        }
+
+        /* ---- 4.2 连按 Esc：只关一次 ---- */
+        await open();
+        esc();
+        esc();
+        esc();
+        await settle(closed);
+        ok('连按三下 Esc：只关一次且收得干净', closed(),
+          `hidden=${viewerEl.hidden}`);
+
+        /* ---- 4.3 上一张还没关完就点下一张 ---- */
+        await open();
+        const seqBefore = closeCalls().length;
+        esc();
+        deliver(SESSION());
+        await settle(closed, 3000);
+        ok('刚关掉就立刻再来一次：仍能收干净', closed(), `hidden=${viewerEl.hidden}`);
+        ok('刚关掉就立刻再来一次：不会多发一次让位',
+          closeCalls().length >= seqBefore, `close_viewer=${closeCalls().length}`);
+
+        /* ---- 4.4 开场等待期间按 Esc = 取消这次打开 ---- */
+        {
+          const before = closeCalls().length;
+          deliver(SESSION());
+          // 让会话真的被 openSession 接手（同步派发只排在微任务里），再趁画面
+          // 还没落地按 Esc —— 这才是真机上「还在等切全屏就按 Esc」的时序。
+          await sleep(0);
+          esc();
+          await settle(closed, 3000);
+          ok(
+            '开场等待期间按 Esc：能取消这次打开（不会自己打开）',
+            closed(),
+            `hidden=${viewerEl.hidden} priming=${viewerEl.classList.contains('is-priming')}`
+          );
+          ok('取消打开也算一次让位（预览窗口不会留在屏幕上）',
+            closeCalls().length === before + 1,
+            `close_viewer=${closeCalls().length}`);
+        }
+
+        /* ---- 4.5 immersive 会话：关闭 = 退出应用 ---- */
+        {
+          immersive = true;
+          for (let round = 1; round <= 2; round += 1) {
+            const mark = calls.length;
+            const exitsBefore = calls.filter((c) => c.cmd === 'exit_app').length;
+            const closesBefore = closeCalls().length;
+            const openWait = await open();
+            // 关键：immersive 会话绝不能走 close_viewer —— 那会把主窗口叫到
+            // 前台，而它在「打开方式」这条路上从头到尾都不该露面。
+            esc();
+            await settle(closed, 3000);
+            ok(
+              `「打开方式」第${round}次：关闭后正好退出一次应用`,
+              calls.filter((c) => c.cmd === 'exit_app').length === exitsBefore + 1,
+              `序列=${calls
+                .slice(mark)
+                .map((c) => c.cmd)
+                .join('>')} 开=${openWait}ms`
+            );
+            ok(
+              `「打开方式」第${round}次：不会叫醒主窗口`,
+              closeCalls().length === closesBefore,
+              `close_viewer=${closeCalls().length}`
+            );
+          }
+          immersive = false;
+        }
+
+        /* ---- 5. 主线程还活着吗 ----
+         * 不用 rAF 判定（无头虚拟时间下它常常根本不回调）。改测**宏任务是否
+         * 还能及时兑现**：如果页面里有失控的循环，连 setTimeout(0) 都会被拖住，
+         * 这一条最先挂。
+         */
+        let beats = 0;
+        const beat = () => {
+          beats += 1;
+          setTimeout(beat, 10);
+        };
+        const t0 = Date.now();
+        beat();
+        await sleep(600);
+        const elapsed = Date.now() - t0;
+        ok('主线程仍在处理任务（没有失控循环占死它）', beats > 5, `beats=${beats}`);
+        ok(
+          '任务调度没有被拖慢（每轮进出没有留下常驻负载）',
+          beats >= 10 && elapsed < 3000,
+          `beats=${beats} 用时=${elapsed}ms`
+        );
+
+        /* ---- 6. 控制台必须干净 ---- */
+        ok(
+          '全程没有未捕获异常 / 未处理的 rejection',
+          errors.length === 0,
+          errors.slice(0, 3).join(' | ')
+        );
+      } catch (error) {
+        ok('未捕获异常', false, String(error?.stack || error));
+      }
+    </script>
+  </body>
+</html>

@@ -1,14 +1,39 @@
 /**
- * 应用入口：装配网格与全屏查看器，绑定工具栏、快捷键与拖放提示。
+ * 图片墙入口。
+ *
+ * 这个模块跑在 `main` 窗口上，只负责浏览器界面（网格 / 顶栏 / 空状态）。
+ * **预览不在这里** —— 那是 `viewer` 窗口与 `ui/js/viewer-main.js` 的事。
+ *
+ * # 为什么要分家
+ *
+ * 以前预览与图片墙共用一个窗口，进预览 = 切这个窗口的形态（进全屏 / 摘掉
+ * 标题栏 / 摆尺寸），退出 = 切回来。而**任何**一次对几何或样式的写入都会被
+ * 窗口层记成「退出全屏时照着还原」的目标：
+ *
+ *   * 运行时摘过装饰 → tao 把无边框那份 styleMask 存进 `saved_style`，退出时
+ *     无条件写回，我们补回标题栏那一笔必然被覆盖；
+ *   * 进全屏前把窗口摆到整块屏 → macOS 当场判定它 `zoomed`，从此把「最大化」
+ *     当成全屏前的样子，退出时一丝不差地还原到最大化。
+ *
+ * 分家之后这条窗口**一次全屏都没进过、一次几何都没被写过**。它既不需要
+ * 「还原」，也没有任何代码能把它写脏 —— 它就待在用户最后摆放的位置上。
+ *
+ * 代价是图片集合与来源几何要在两个 webview 之间过一趟后端：这里是**发起**
+ * 的那一侧（{@link openPreview}），预览那边是**接收**的一侧。
  */
 
 import * as api from './api.js';
 import { Grid } from './grid.js';
-import { Viewer } from './viewer.js';
 import { initTheme, mountThemeToggles } from './theme.js';
-import { launchOriginRect, launchWindowRect } from './launch.js';
+import { launchOriginScreenRect } from './launch.js';
 
 const el = (id) => document.getElementById(id);
+
+// 让样式表知道自己在哪个平台上 —— macOS 的交通灯画在窗口左上角，页面顶部靠左
+// 的内容得给它让出位置。见 `app.css` 里的 `--traffic-light-inset`。
+if (api.platform) {
+  document.documentElement.dataset.platform = api.platform;
+}
 
 const dom = {
   grid: el('grid'),
@@ -16,8 +41,7 @@ const dom = {
   empty: el('empty'),
   status: el('status-text'),
   cache: el('cache-text'),
-  toast: el('toast'),
-  viewer: el('viewer')
+  toast: el('toast')
 };
 
 /* ------------------------------------------------------------------ *
@@ -52,18 +76,61 @@ function toast(message) {
 const grid = new Grid({
   root: dom.grid,
   spacer: dom.spacer,
-  onActivate: (index, cell) => viewer.open(index, cell)
+  onActivate: (index, cell) => openPreview(index, cell)
 });
 
-const viewer = new Viewer({
-  root: dom.viewer,
-  grid,
-  onError: (message) => toast(message),
-  // 沉浸式预览（从文件管理器唤起）关闭后直接退出，回到文件管理器
-  onExit: () => {
-    api.exitApp().catch(() => window.close());
-  }
-});
+/* ------------------------------------------------------------------ *
+ * 打开预览
+ * ------------------------------------------------------------------ */
+
+/**
+ * 把某一格缩略图的位置折成**物理像素、屏幕坐标系**里的矩形。
+ *
+ * 这一步是跨窗口传几何的关键。DOM 给的 `getBoundingClientRect()` 是**本窗口
+ * 视口坐标**，预览窗口读不懂 —— 它全屏落在哪块屏取决于我们这条窗口在哪块
+ * 屏，视口原点未必是 (0,0)。折到共同的桌面坐标系里，那边减掉自己的原点就
+ * 拿得到正确起点（见 `launch.js` 的 `viewportRectFrom`）。
+ *
+ * 用物理像素是为了绕开 `scale_factor`：那个查询是「发消息给事件循环 → 阻塞
+ * 等回执」的 getter，在命令里问它会自锁。两端都用物理像素，加减自然抵消。
+ *
+ * @param {?Element} cell 那一格（拿不到时返回 null，预览退化为中心放大）
+ */
+async function originRectOf(cell) {
+  const rect = cell?.getBoundingClientRect?.();
+  if (!rect || !(rect.width > 0) || !(rect.height > 0)) return null;
+
+  const origin = await api.windowOrigin();
+  if (!origin) return null;
+
+  const dpr = window.devicePixelRatio || 1;
+  return {
+    x: origin.x + rect.left * dpr,
+    y: origin.y + rect.top * dpr,
+    width: rect.width * dpr,
+    height: rect.height * dpr
+  };
+}
+
+/**
+ * 图片墙 → 预览。
+ *
+ * 与「打开方式」共用后端同一个入口（`open_viewer`），所以开场几何、透明度
+ * 渐变、时长缓动，以及之后缩放 / 拖拽 / 左右切换 / 点击空白或 Esc 关闭 /
+ * 键盘快捷键，在代码上都是同一份实现 —— 它们不是「各自差不多」，而是同一个
+ * 目标窗口的两次唤起。
+ *
+ * 注意这里**不切窗口形态**：主窗口不进全屏、不摆尺寸、不摘装饰。退出预览
+ * 后它回到原样，靠的不是「还原得准」，而是**从来没被改过**。
+ *
+ * @param {number} index
+ * @param {?Element} cell 来源那一格
+ */
+async function openPreview(index, cell = null) {
+  const origin = await originRectOf(cell).catch(() => null);
+  const ok = await api.openViewer(index, origin, false);
+  if (!ok) toast('打开预览失败');
+}
 
 /* ------------------------------------------------------------------ *
  * 数据装载
@@ -85,8 +152,6 @@ async function refreshCacheStats({ delay = 900 } = {}) {
 function load(payload) {
   const items = payload?.items ?? [];
   grid.setItems(items);
-  viewer.setItems(items);
-  refreshCacheStats();
 
   const source = payload?.source ?? '';
   dom.empty.classList.toggle('is-visible', items.length === 0);
@@ -99,23 +164,42 @@ function load(payload) {
     dom.status.textContent = '没有找到支持的图片';
     document.title = 'PicShow';
   }
+  refreshCacheStats();
 }
 
 api.onItems(load).catch((error) => toast(String(error)));
 
 /* ------------------------------------------------------------------ *
+ * 预览关掉了：把网格滚到用户最后看的那一张
+ *
+ * 这是两个窗口之间唯一反向的状态流动。用户在预览里翻到第几张，退出后图片
+ * 墙就停在第几张 —— 否则「看了二十张，退出来还在第一张」，那种割裂感非常
+ * 明显。
+ * ------------------------------------------------------------------ */
+
+api
+  .onViewerClosed((payload) => {
+    const index = Number(payload?.index);
+    if (!Number.isFinite(index) || index < 0) return;
+    grid.ensureVisible(index);
+    // 焦点交回网格，方向键继续在图片墙上走
+    dom.grid.focus();
+  })
+  .catch((error) => toast(String(error)));
+
+/* ------------------------------------------------------------------ *
  * 从文件管理器打开（右键 → 打开方式 → PicShow）
  *
  * 这条路径的语义与「先开 PicShow 再选图」完全不同：
- *   * 不显示浏览器界面（顶栏 / 网格 / 空状态全部让位），直接进全屏预览；
- *   * 关闭即退出应用 —— 这个窗口本来就是为看这一张而存在的；
+ *   * 不显示浏览器界面 —— 直接唤起预览窗口，关闭即退出应用；
  *   * 画廊集合是目标图片**所在目录**里的全部图片，按文件名排序。
+ *
+ * 主窗口全程**保持隐藏**：它这次根本不该露面。后端 3 秒兜底也因此必须先问
+ * 「预览起来了没有」才敢点亮（见 `lib.rs`）。
  * ------------------------------------------------------------------ */
 
 /** 这次启动的打开请求是否已经被某条通道接管（两条通道只认领一次） */
 let launchHandled = false;
-/** 窗口是否已经被点亮 —— 冷启动的预览分支要靠它决定走哪条路 */
-let windowShown = false;
 
 /**
  * 认领一次「系统要求打开图片」的请求。
@@ -139,8 +223,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * 为什么要等：Windows 的关联打开、Linux 的 `%F` 把路径直接放进 argv，进程
  * 第一行就能判定这次是预览启动；macOS 不行 —— LaunchServices 不把文件放进
  * argv，而是等事件循环转起来之后用 Apple Event 送来，而那可能比首屏还慢
- * 半拍。这时候要是直接点亮主界面，用户看到的就是「主界面一闪而过，然后才
- * 变成全屏预览」。
+ * 半拍。这时候要是直接点亮主界面，用户看到的就是「主界面一闪而过」。
  *
  * 预算是**从进程启动时刻**起算的绝对值，不是「从现在起再等 N 毫秒」：首屏
  * 加载慢的机器来问时预算早已经耗尽，常规启动一点都不会被拖慢。
@@ -161,78 +244,53 @@ async function takeLaunchOrWait() {
 }
 
 /**
- * 焦点交接：首图落地 → DOM 焦点交给预览 → 再向后端要一次窗口焦点。
+ * 唤起预览窗口（「打开方式」专用）。
  *
- * 三个条件缺一不可（理由见后端 `focus_window` 的注释）：窗口还没点亮时要
- * 焦点会被平台直接忽略、maximize 会把刚抢到的焦点让出去、图片没到时按下去
- * 的方向键落在空画面上。所以只能排在这儿 —— 窗口已显示、动画已开始、
- * 首图正在落地。
+ * 这次预览是为这一张而开的，所以 `immersive` 为真：预览那边关闭即退出应用。
+ * 主窗口一个字都不碰 —— 不点亮、不摆尺寸、不进全屏。
+ *
+ * @param {object} payload
  */
-async function handOverFocus() {
-  await viewer.focusWhenReady().catch(() => {});
-  await api.focusWindow().catch(() => {});
-  // 「焦点到底落没落上」是典型的静默故障：界面上看不出焦点在哪儿。问一次并
-  // 打到终端（logError 只在 PICSHOW_DEBUG=1 时输出），以后排这一类问题不用
-  // 再靠猜。
-  api.logError(
-    `[focus] hasFocus=${document.hasFocus()} ` +
-      `active=${document.activeElement?.id || document.activeElement?.tagName}`
-  );
+async function bootLaunch(payload) {
+  // 先把数据备好：万一预览那条路没走通，点亮主界面时也有内容可看
+  load({ items: payload.items, source: payload.source });
+
+  // 把后端那份「待取件」取走（不看结果）：一是保证同一次请求不会被两条通道
+  // 各处理一遍；二是让后端知道这次启动已由预览分支接管 —— `window_ready`
+  // 据此拒绝再点亮主界面。
+  await api.takeLaunchTarget().catch(() => {});
+
+  // 来源矩形来自后端记录的启动瞬间光标位置。后端给的是物理像素，这里统一折
+  // 成物理像素的屏幕矩形，好让预览那边减掉自己的原点（见 `originRectOf`）。
+  const point = await api.launchOrigin().catch(() => null);
+  const origin = launchOriginScreenRect(point, window.devicePixelRatio || 1);
+
+  const ok = await api.openViewer(payload.index ?? 0, origin, true);
+  if (!ok) {
+    // 预览没起来：留一个隐身的窗口，用户只会看到「启动了但什么都没有」。
+    // 这时点亮主界面，至少还能选图。
+    await api.showWindow().catch(() => {});
+    dom.grid.focus();
+  }
 }
 
 /**
- * 播放「从那一格长出来」的开场动画。
+ * 应用已运行时，用户又从 Finder 打开了另一张。
  *
- * 来源矩形来自后端记录的启动瞬间光标位置；拿不到就退化为屏幕中心 0.8 倍。
- * 两个入口共用（冷启动的 boot、应用已在跑时的 Opened 事件），避免两处走着
- * 走着又不一样。
+ * 后端在派发这一次请求时已经直接把预览推起来了（`deliver_launch` 里
+ * `is_ready()` 那一路），这里只负责让网格跟上新的图片集合 —— 用户关掉预览
+ * 之后看见的应该是他刚打开的那个文件夹。
  */
-async function openLaunchView(payload) {
-  const origin = await api.launchOrigin().catch(() => null);
-  viewer.openLaunch(payload.index ?? 0, launchOriginRect(origin));
-  await handOverFocus();
+function adoptLaunch(payload) {
+  load({ items: payload.items, source: payload.source });
 }
 
-async function enterImmersive(payload) {
-  const items = payload?.items ?? [];
-  if (!items.length) return;
-
-  document.body.classList.add('is-immersive');
-
-  // 冷启动时窗口**还藏着**：必须走启动分支（它会趁窗口藏着把形态与尺寸定好
-  // 再点亮）。直接在这儿开预览，动画就播给一个隐身窗口看了。
-  if (!windowShown) {
-    await bootLaunch(payload);
-    return;
-  }
-
-  // 应用已经在跑、用户又从 Finder 打开了另一张：先关掉旧的再开新的。
-  // 关之前必须临时摘掉「关闭即退出」，否则会在中途把应用整个退掉。
-  if (viewer.isOpen) {
-    viewer.setExitOnClose(false);
-    await viewer.close();
-  }
-
-  // 去掉系统绘制的原生标题栏（颜色/模糊跟预览面对不上，也不受空闲计时
-  // 控制）。页面里那条 viewer-bar 接管标题栏的角色：背景同源、显隐同步。
-  await api.setImmersiveChrome(true).catch(() => {});
-  // 等窗口形态变化后的尺寸落定，别按旧尺寸适配完又弹一下
-  await nextFrames(2);
-
-  grid.setItems(items);
-  viewer.setItems(items);
-  // 关闭 = 退出，回到文件管理器
-  viewer.setExitOnClose(true);
-  await openLaunchView(payload);
-
-  // 窗口标题由后端在装载时同步（set_title 走插件权限，前端调用容易静默失败）
-  refreshCacheStats({ delay: 300 });
-}
-
-api.onLaunch((payload) => {
-  const taken = claimLaunch(payload);
-  if (taken) enterImmersive(taken);
-}).catch((error) => toast(String(error)));
+api
+  .onLaunch((payload) => {
+    const taken = claimLaunch(payload);
+    if (taken) adoptLaunch(taken);
+  })
+  .catch((error) => toast(String(error)));
 
 /* ------------------------------------------------------------------ *
  * 工具栏 / 快捷键
@@ -247,8 +305,7 @@ el('btn-open-folder').addEventListener('click', () => pick('folder'));
 el('btn-empty-files').addEventListener('click', () => pick('files'));
 el('btn-empty-folder').addEventListener('click', () => pick('folder'));
 
-// 主题开关要挂两处：顶栏（浏览界面）与预览标题栏（沉浸式下只有后者够得着）
-mountThemeToggles([el('btn-theme'), el('btn-theme-viewer')]);
+mountThemeToggles([el('btn-theme')]);
 
 window.addEventListener('keydown', (event) => {
   const meta = event.metaKey || event.ctrlKey;
@@ -260,12 +317,11 @@ window.addEventListener('keydown', (event) => {
   }
 });
 
-// 网格获得焦点时回车 → 打开第一张
+// 网格获得焦点时回车 → 打开第一张（与鼠标点击同一条预览路径）
 dom.grid.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && grid.count > 0) {
     event.preventDefault();
-    const cell = grid.cellFor(0);
-    viewer.open(0, cell);
+    openPreview(0, grid.cellFor(0));
   }
 });
 
@@ -339,8 +395,8 @@ applyHostMode();
 /**
  * 启动收尾。两条互不相干的路：
  *
- *   * 从文件管理器打开 —— 走 `bootLaunch()`：不建立主界面，窗口直接以沉浸式
- *     全屏亮起并播放放大动画；
+ *   * 从文件管理器打开 —— 走 `bootLaunch()`：唤起预览窗口，主界面从头到尾
+ *     都不出现（这次它就是不该露面）；
  *   * 常规启动 —— 点亮主界面（网格 / 空状态），等用户的下一步操作。
  *
  * 只在**该走的那一分支**上显示窗口，是「一闪而过」的唯一解药：主界面一旦
@@ -367,88 +423,13 @@ async function boot() {
     );
     return;
   }
-  // 事件通道已经在跑了（enterImmersive 自己会点亮窗口），这里再插手就重复了
+  // 事件通道已经在跑了（adoptLaunch 只更新数据，不点亮窗口）
   if (launchHandled) return;
 
   await api.showWindow();
-  windowShown = true;
-  // 焦点给网格，回车就能打开第一张。沉浸式那条分支里网格是 display:none，
-  // 抢这一步只会把焦点从预览视图上挪走。
-  if (!document.body.classList.contains('is-immersive')) dom.grid.focus();
+  // 焦点给网格，回车就能打开第一张
+  dom.grid.focus();
 }
-
-/**
- * 「右键 → 打开方式」的专属启动路径。
- *
- * 要解决的正是「窗口一闪而过」：以前的顺序是 showWindow → 等两帧 → 再切到
- * 预览，中间那几帧主界面是实打实画出来的。所以这里把顺序反过来 ——
- *
- *   1. 先加 `is-immersive`（纯 CSS，不等任何 IPC）：主界面从此不可能被绘制；
- *   2. 让后端趁窗口还藏着把形态与尺寸定好，**然后才点亮**（`prepareLaunchWindow`）；
- *   3. 等布局确认已经长到目标大小 —— 这一步等的是**布局**，不是图片：几何来自
- *      items 的宽高元数据，所以第一帧就有正确的起止位置；
- *   4. 最后播放放大动画：从启动瞬间光标所在那一格（拿不到则从屏幕中心 0.8 倍）
- *      FLIP 到全屏，并叠加透明度渐变。
- */
-async function bootLaunch(payload) {
-  document.body.classList.add('is-immersive');
-
-  grid.setItems(payload.items);
-  viewer.setItems(payload.items);
-  viewer.setExitOnClose(true);
-
-  // 把后端那份「待取件」取走（不看结果）：一是保证同一次请求不会被两条通道
-  // 各处理一遍；二是让后端知道这次启动已经由预览分支接管 —— `window_ready`
-  // 据此拒绝再点亮主界面。
-  await api.takeLaunchTarget().catch(() => {});
-
-  // 来源坐标这一问放在 promises 里**并行**跑出去，别把首帧拖住
-  const originPromise = api.launchOrigin();
-
-  await api
-    .prepareLaunchWindow(launchWindowRect())
-    .catch(() => api.showWindow());
-  windowShown = true;
-
-  // 等窗口真的长到目标尺寸再开画：maximize 的结果常常比 IPC 回执晚一到两帧，
-  // 而 FLIP 的起点是按**当前**可视区算的 —— 若按旧尺寸先算，动画就会从错误的
-  // 方向长出来。
-  const target = launchWindowRect();
-  await waitFor(
-    () =>
-      Math.abs(document.documentElement.clientWidth - target.width) <= 2 &&
-      Math.abs(document.documentElement.clientHeight - target.height) <= 2,
-    8
-  );
-
-  const origin = await originPromise.catch(() => null);
-  viewer.openLaunch(payload.index ?? 0, launchOriginRect(origin));
-  refreshCacheStats({ delay: 300 });
-  // 等到首图落地再交焦点：早一步会被 maximize / 布局落定那几帧冲掉
-  await handOverFocus();
-}
-
-/**
- * 等条件成立，最多等 `maxFrames` 帧。
- *
- * 为什么要有帧数上限：万一某个平台到了设置好的帧数还没回调那一帧，
- * 宁可按旧尺寸先跑起来，也不能让用户盯着黑屏。
- */
-const waitFor = (predicate, maxFrames = 8) =>
-  new Promise((resolve) => {
-    const step = (left) => {
-      if (predicate() || left <= 0) resolve();
-      else requestAnimationFrame(() => step(left - 1));
-    };
-    step(maxFrames);
-  });
-
-const nextFrames = (n) =>
-  new Promise((resolve) => {
-    const step = (left) =>
-      left <= 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
-    step(n);
-  });
 
 // 兜住所有没被局部捕获的异常：webview 的 console 不进终端，
 // 没有这里就只剩「界面没反应」这类无从下手的报告。

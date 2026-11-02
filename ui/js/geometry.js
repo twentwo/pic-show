@@ -61,10 +61,24 @@ export function zoomAround(t, p, ratio) {
 
 /**
  * 求「把居中于视口的内容框 base」映射到页面矩形 rect 的变换。
- * 由于 base 与 rect 宽高比一致，缩放是等比的，视觉上完全连续。
+ *
+ * 缩放按 **cover** 取：两个方向各算一次，取大的那个。
+ *
+ * 这一点是「缩略图 ↔ 全屏」这次转场能不能对得上的关键。网格里那一格是
+ * `object-fit: cover` 裁出来的 —— 画面被裁掉一圈，只露出中间那块；而全屏是
+ * `contain`，整张都在。若按「宽度对齐」取缩放（也就是 contain 的思路），起点
+ * 框就会比那一格矮一截或窄一截：动画开头那一帧和刚点的缩略图对不上，看上去
+ * 就是「先跳一下再长大」。
+ *
+ * 取大值之后画面会**溢出**那一格一点，溢出量由调用方用 `clip-path` 裁掉 ——
+ * 裁完就是缩略图那一格逐像素相同的画面（同一张图、同样的裁切规则）。
+ *
+ * 缩放仍然是等比的（只有一个 scale），一次 transform 就够，视觉上完全连续。
  */
 export function mapBoxToRect(base, rect, view) {
-  const scale = base.w > 0 ? rect.width / base.w : 1;
+  const byWidth = base.w > 0 ? rect.width / base.w : 1;
+  const byHeight = base.h > 0 ? rect.height / base.h : 1;
+  const scale = Math.max(byWidth, byHeight);
   const tx = rect.left + rect.width / 2 - (view.left + view.w / 2);
   const ty = rect.top + rect.height / 2 - (view.top + view.h / 2);
   return { scale, tx, ty };

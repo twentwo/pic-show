@@ -16,13 +16,27 @@
         out.textContent = log.join('\n');
       };
 
-      // 用真实的 index.html 结构，避免探针与线上 DOM 分叉
-      const html = await (await fetch('./index.html')).text();
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      for (const node of [...doc.body.children]) {
-        if (node.tagName === 'SCRIPT') continue;
-        document.body.appendChild(node);
-      }
+      // 用真实的页面结构，避免探针与线上 DOM 分叉。
+      //
+      // 现在是**两个页面**：图片墙（`index.html`）与预览（`viewer.html`）分属
+      // 两个物理窗口、两个 webview，彼此没有共享的 JS 上下文。探针只有一个
+      // 文档，索性把两边的 DOM 都拼进来 —— 这样既测到真实结构，也让「预览
+      // DOM 不在主页面里」这件事有可断言的对象（11.6 会量它）。
+      const pageOf = async (file) =>
+        new DOMParser().parseFromString(await (await fetch(file)).text(), 'text/html');
+      const wallDoc = await pageOf('./index.html');
+      const viewerDoc = await pageOf('./viewer.html');
+      // 先取证再搬：节点搬走之后，原文档里就再也查不到了（11.6 要用）
+      const wallHasViewer = wallDoc.getElementById('viewer') !== null;
+      const viewerHasViewer = viewerDoc.getElementById('viewer') !== null;
+      const adopt = (doc) => {
+        for (const node of [...doc.body.children]) {
+          if (node.tagName === 'SCRIPT') continue;
+          document.body.appendChild(node);
+        }
+      };
+      adopt(wallDoc);
+      adopt(viewerDoc);
 
       // 无头环境拿不到合成帧，Web Animations 永不 finished。
       // 换成「立刻完成」的替身：动画的终值本来就是代码预写进 inline style 的，
@@ -38,6 +52,21 @@
       const lastOf = (el) => {
         for (let i = animations.length - 1; i >= 0; i -= 1) {
           if (animations[i].el === el) return animations[i];
+        }
+        return null;
+      };
+      /**
+       * 元素上最后一次**带某个属性**的 animate() 调用。
+       *
+       * 位移与透明度已经拆成两条并行动画（一条动画只能给一条缓动曲线，而这
+       * 两种运动想要的节奏不一样），所以不能无脑取最后一条 —— 得按关键帧里
+       * 有没有目标属性来挑。
+       */
+      const lastWith = (el, key) => {
+        for (let i = animations.length - 1; i >= 0; i -= 1) {
+          if (animations[i].el === el && animations[i].keyframes?.[key] !== undefined) {
+            return animations[i];
+          }
         }
         return null;
       };
@@ -59,16 +88,22 @@
       const grid = new Grid({
         root: document.getElementById('grid'),
         spacer: document.getElementById('grid-spacer'),
-        onActivate: (i, cell) => viewer.open(i, cell)
+        // 真实主页面里这一点击是把请求交给后端中转（预览在另一个窗口），
+        // 探针里留个空回调：网格自己能被激活，但不牵出预览。
+        onActivate: () => {}
       });
-      const viewer = new Viewer({ root: document.getElementById('viewer'), grid });
+      // 预览不再认识网格：它在另一个窗口里，来源几何是后端转过来的矩形
+      const viewer = new Viewer({
+        root: document.getElementById('viewer'),
+        onError: () => {}
+      });
 
       grid.setItems(items);
       viewer.setItems(items);
 
       const stage = viewer.stage;
       // viewer 还是 hidden 时 clientWidth = 0，必须先打开再量
-      viewer.open(2, null);
+      viewer.openLaunch(2, null);
       const stageW = stage.clientWidth;
       const centerOf = (el) => {
         const r = el.getBoundingClientRect();
@@ -230,7 +265,7 @@
       ok('下拉松手后关闭', viewer.root.hidden === true);
 
       /* ---------- 7.8 点图片外关闭 ---------- */
-      viewer.open(1, null);
+      viewer.openLaunch(1, null);
       await sleep(400); // 展开动画期间手势是冻结的
       pd('pointerdown', 6, 6, 4);
       pd('pointerup', 6, 6, 4);
@@ -355,7 +390,7 @@
           viewer.strip._ro instanceof ResizeObserver
       );
 
-      viewer.open(2, null);
+      viewer.openLaunch(2, null);
       await sleep2(60);
       const vroot = viewer.root;
       const w1 = viewer.stage.clientWidth;
@@ -433,7 +468,7 @@
       await viewer.close();
 
       /* ---------- 9. 空闲自动隐藏 vs 指针事件 ---------- */
-      viewer.open(1, null);
+      viewer.openLaunch(1, null);
       await sleep2(60);
       const vr = viewer.root;
       // 窄屏只有 414 宽，坐标必须按 stage 现算，不能写死
@@ -527,29 +562,36 @@
       await viewer.close();
 
       /* ---------- 10. 关闭 ---------- */
-      viewer.open(1, null);
+      viewer.openLaunch(1, null);
       await viewer.close();
       ok('关闭后隐藏', viewer.root.hidden === true);
       ok('关闭后槽位清空', indexes().every((i) => i < 0), indexes().join(','));
 
       /* ---------- 11. 从文件管理器打开（沉浸式预览） ---------- */
 
-      // 11.1 关闭即退出：这个窗口是为看这一张而存在的
-      let exitCalls = 0;
-      viewer.onExit = () => { exitCalls += 1; };
-      viewer.setExitOnClose(true);
-      viewer.open(1, null);
+      // 11.1 收尾只有**一个出口**：预览自己不再认识「沉浸式」这个词。
+      //
+      // 要不要连带退出应用是**会话语义**，只有宿主（预览窗口那条 entry）知道
+      // 这次是为看一张图开的，还是从图片墙点进来的。早先 Viewer 自己揣着
+      // `exitOnClose` 开关并另配一条 `onExit`，于是「打开方式」那次关闭会
+      // 退出两次应用 —— 两条出口并存正是这类重复动作的温床。现在只留
+      // `onClosed` 一条，退不退出由调用方在那里面决定。
+      let closedCalls = 0;
+      viewer.onClosed = () => {
+        closedCalls += 1;
+      };
+      viewer.openLaunch(1, null);
       await viewer.close();
-      ok('沉浸式关闭后退出应用', exitCalls === 1, String(exitCalls));
-      viewer.setExitOnClose(false);
-      viewer.open(1, null);
-      await viewer.close();
-      ok('非沉浸式关闭不退出', exitCalls === 1, String(exitCalls));
+      ok('关闭后只通知一次（收尾就这一个出口）', closedCalls === 1, String(closedCalls));
+      ok('预览不再揣着「关闭即退出」开关', typeof viewer.setExitOnClose !== 'function');
+      ok('预览不再认识 onExit 那条旧出口', viewer.onExit === undefined);
+      // 后面几节还要反复开关，那时不关心回调
+      viewer.onClosed = () => {};
 
       // 11.2 目录里只有这一张图：不显示胶片条与左右按钮，计数器 1 / 1
       const single = [{ id: 'solo', name: 'only-one.jpg', width: 800, height: 600 }];
       viewer.setItems(single);
-      viewer.open(0, null);
+      viewer.openLaunch(0, null);
       ok('单图时隐去胶片条', viewer.root.classList.contains('no-strip'));
       ok(
         '单图时隐去左右按钮',
@@ -565,7 +607,7 @@
 
       // 11.3 首 / 末张：默认禁用（并给回弹），不是循环
       viewer.setItems(items);
-      viewer.open(0, null);
+      viewer.openLaunch(0, null);
       ok(
         '首张时「上一张」禁用、「下一张」可用',
         viewer.prevBtn.disabled === true && viewer.nextBtn.disabled === false,
@@ -592,7 +634,10 @@
       viewer.setLoop(false);
       await viewer.close();
 
-      // 11.5 沉浸式样式：浏览器界面（顶栏 / 网格 / 空状态）一律不出现
+      // 11.5 沉浸式样式：浏览器界面（顶栏 / 网格 / 空状态）一律不出现。
+      //
+      // 预览是独立窗口，它自己的页面里压根没有那三样东西 —— 这几条规则是给
+      // 「预览 DOM 被拼进主页面」那种场合（比如本探针）留的兜底。
       ok(
         '沉浸式规则隐藏顶栏与网格',
         /body\.is-immersive\s+\.topbar,[\s\S]*?\{[^}]*display:\s*none/.test(cssText)
@@ -601,25 +646,66 @@
         '沉浸式规则隐藏空状态',
         /body\.is-immersive\s+\.empty\s*\{[^}]*display:\s*none/.test(cssText)
       );
+      // 铺满不靠 `is-immersive` 那条附加规则了（它已经删掉）：预览是独立窗口，
+      // `.viewer` 自己就是铺满的，不需要再为浏览器界面让位。
       ok(
-        '沉浸式下查看器铺满整个窗口',
-        /body\.is-immersive\s+\.viewer\s*\{[^}]*inset:\s*0/.test(cssText)
+        '预览自己就铺满整个窗口（不再需要「沉浸式附加规则」）',
+        /^\.viewer \{[\s\S]*?inset: 0;/m.test(cssText) &&
+          !/body\.is-immersive\s+\.viewer\s*\{/.test(cssText)
       );
 
-      // 系统绘制的原生标题栏与预览面对不上色、也不受空闲计时控制，
-      // 所以进入沉浸式前必须先让后端把它关掉（且要在窗口点亮之前）。
+      // 11.6 「窗口形态」这一整类代码在方案 B 里被删掉了：主窗口与预览窗口是
+      // 两个物理窗口，图片墙那条**一次全屏都没进过、一次几何都没被写过**，它
+      // 根本不存在「退出预览要还原成什么」这个问题 —— 它就待在用户最后摆放的
+      // 位置上。所以这里不再判「切得对不对」，改判「分家分干净了没有」。
       const mainSrc = await (await fetch('./js/main.js')).text();
+      const viewerMainSrc = await (await fetch('./js/viewer-main.js')).text();
       ok(
-        '进入沉浸式前关掉原生标题栏',
-        /setImmersiveChrome\(true\)/.test(mainSrc) &&
-          mainSrc.indexOf('setImmersiveChrome(true)') < mainSrc.indexOf('showWindow()')
+        '主页面进预览只有 `api.openViewer` 这一条路（图片墙 + 打开方式）',
+        (mainSrc.match(/api\.openViewer\(/g) || []).length === 2,
+        `openViewer=${(mainSrc.match(/api\.openViewer\(/g) || []).length}`
+      );
+      ok(
+        '主页面里不再有预览的入口与 DOM（预览住在自己的窗口里）',
+        !/viewer\.open|openLaunch\(|openFullscreen\(/.test(mainSrc) &&
+          viewerHasViewer &&
+          !wallHasViewer
+      );
+      ok(
+        '主页面不再有任何形态命令（去装饰 / 全屏 / 摆尺寸一概没有）',
+        !/api\.setStage\(|api\.setFullscreen\(|api\.setImmersiveChrome\(|useImmersiveStage/.test(
+          mainSrc
+        )
+      );
+      ok(
+        '预览侧只叫一次后端收窗口（叫两次会第二次点亮主窗口）',
+        (viewerMainSrc.match(/api\.closeViewer\(/g) || []).length === 1,
+        `closeViewer=${(viewerMainSrc.match(/api\.closeViewer\(/g) || []).length}`
+      );
+      // 「等帧」必须有 setTimeout 兜底：rAF 在窗口转场 / 最小化 / 切 Space 时
+      // 会停摆，裸等帧的 Promise 永不兑现 —— 那正是「退出预览后卡死」的成因。
+      const asyncSrc = await (await fetch('./js/async.js')).text();
+      ok(
+        '等帧函数都挂了 setTimeout 兜底（帧停摆时也一定兑现）',
+        /export function nextFrames\(n, budgetMs = \d+\)[\s\S]*?timer = setTimeout\(finish, budgetMs\)/.test(
+          asyncSrc
+        ) &&
+          /export function waitFor\(predicate, maxFrames = \d+, budgetMs = \d+\)[\s\S]*?timer = setTimeout\(finish, budgetMs\)/.test(
+            asyncSrc
+          )
+      );
+      ok(
+        '关闭的收尾挂在 finally 上（任何一段 await 挂住都收得掉）',
+        /try \{\s*await this\.playClose\(\{ fromDismiss \}\);\s*\} finally \{\s*this\.finishClose\(\);\s*\}/.test(
+          await (await fetch('./js/viewer.js')).text()
+        )
       );
 
       /* ---------- 12. 标题栏与预览面的统一 ---------- */
 
       const barEl = document.getElementById('viewer-bar');
       const bgOf = (el) => getComputedStyle(el).backgroundColor;
-      viewer.open(1, null);
+      viewer.openLaunch(1, null);
       await sleep2(60);
 
       // 主题切换时背景色是有过渡的，读计算值会读到中间帧。
@@ -936,124 +1022,206 @@
       localStorage.removeItem(theme.THEME_KEY);
 
       // ---- 14. 「右键 → 打开方式」的直达全屏启动 -------------------------
-      const { launchOriginRect, launchWindowRect, CENTER_ZOOM_SCALE } =
+      const { launchOriginScreenRect, viewportRectFrom, CENTER_ZOOM_SCALE } =
         await import('./js/launch.js');
       const launchSrc = await (await fetch('./js/launch.js')).text();
-      const bootSrc = await (await fetch('./js/main.js')).text();
+      // 这一节盯的是**预览窗口那一侧**的时序（主窗口那一侧在 11.6 里判）
+      const bootSrc = await (await fetch('./js/viewer-main.js')).text();
 
       if (viewer.isOpen) await viewer.close();
 
-      // 14.1 后端给的来源点（物理像素 / 桌面坐标系）→ 视口坐标系里的矩形
-      const env = { dpr: 2, offsetX: 40, offsetY: 25, viewW: 800, viewH: 600 };
-      const originRect = launchOriginRect({ x: 1000, y: 500, size: 96 }, env);
-      // (1000/2 - 40, 500/2 - 25) = (460, 225)，再各减半格
+      // 14.1 后端给的光标点 → 屏幕坐标系里的矩形（两端都是物理像素）
+      const originRect = launchOriginScreenRect({ x: 1000, y: 500, size: 96 }, 2);
+      // 边长给的是 CSS 像素：96 × dpr(2) = 192 物理像素，光标居中
       ok(
-        '来源坐标按 dpr 与窗口位置换算到视口坐标系',
+        '来源点按 dpr 折成物理像素的屏幕矩形',
         originRect &&
-          Math.abs(originRect.left - (460 - 48)) < 0.01 &&
-          Math.abs(originRect.top - (225 - 48)) < 0.01,
+          originRect.x === 1000 - 96 &&
+          originRect.y === 500 - 96 &&
+          originRect.width === 192 &&
+          originRect.height === 192,
         JSON.stringify(originRect)
       );
       ok(
-        '来源矩形以光标为中心，边长取传入值',
-        originRect.width === 96 && originRect.height === 96
+        '来源矩形以光标为中心',
+        originRect.x + originRect.width / 2 === 1000 &&
+          originRect.y + originRect.height / 2 === 500
       );
 
       // 14.2 拿不到来源时必须明确退回兜底，而不是返回一个歪掉的小矩形
-      ok('没有来源点时返回 null', launchOriginRect(null, env) === null);
+      ok('没有来源点时返回 null', launchOriginScreenRect(null, 2) === null);
       ok(
         '坐标不是数字时返回 null',
-        launchOriginRect({ x: NaN, y: 1, size: 96 }, env) === null
+        launchOriginScreenRect({ x: NaN, y: 1, size: 96 }, 2) === null
       );
       ok(
         '边长为 0 时返回 null',
-        launchOriginRect({ x: 10, y: 10, size: 0 }, env) === null
+        launchOriginScreenRect({ x: 10, y: 10, size: 0 }, 2) === null
       );
       ok(
-        '起点飞出屏幕时返回 null（宁可退化成中心放大）',
-        launchOriginRect({ x: 999999, y: 999999, size: 96 }, env) === null
+        '边长为负时返回 null（物理像素里没有负的缩略图）',
+        launchOriginScreenRect({ x: 10, y: 10, size: -96 }, 2) === null
       );
       ok('中心兜底倍率是 0.8', CENTER_ZOOM_SCALE === 0.8, String(CENTER_ZOOM_SCALE));
 
-      const windowRect = launchWindowRect();
+      // 14.2b 「目标窗口矩形」已经不存在了。
+      //
+      // 它曾是「退出预览后停在最大化」的元凶：把窗口先摆到整块屏，macOS 当场
+      // 判定它 zoomed，AppKit 从此把「最大化」当成全屏前那一帧，退出时一丝
+      // 不差地还原回去。现在几何终身只读，还原交给 AppKit 自己。
+      // 证据见 tools/appkit_geometry.swift。
       ok(
-        '目标窗口矩形是有限正数（给后端趁窗口还藏着摆尺寸）',
-        [windowRect.x, windowRect.y, windowRect.width, windowRect.height].every(
-          Number.isFinite
-        ) &&
-          windowRect.width > 1 &&
-          windowRect.height > 1,
-        JSON.stringify(windowRect)
+        '不再有「目标窗口矩形」（几何终身只读，还原交给 AppKit）',
+        !/launchWindowRect/.test(launchSrc) && !/launchWindowRect/.test(bootSrc)
       );
 
-      // 14.3 启动分支：主界面根本不能出现在这一条路上
-      ok('main.js 里有独立的启动分支', /async function bootLaunch/.test(bootSrc));
+      // 14.3 跨窗口那一趟几何：折出去 → 折回来，必须原样回来。
+      //
+      // 静态检查只能看到两侧各自写了什么，量不到这一趟往返是否真的抵消。
+      const viewSize = { viewW: 1440, viewH: 900 };
+      const back = viewportRectFrom(originRect, { x: 100, y: 60 }, 2, viewSize);
       ok(
-        '启动分支走上之后直接 return，不会再显示主界面',
-        /if \(pending\?\.items\?\.length\) \{\s*await bootLaunch[\s\S]*?return;/.test(
-          bootSrc
-        )
+        '折出去再折回来：边长回到 CSS 像素的 96',
+        back && back.width === 96 && back.height === 96,
+        JSON.stringify(back)
       );
       ok(
-        '顺序是「先定窗口形态与尺寸 → 点亮 → 量布局 → 才播动画」',
-        /prepareLaunchWindow\(launchWindowRect\(\)\)\s*\.catch\([\s\S]*?const target = launchWindowRect\(\);\s*await waitFor\([\s\S]*?viewer\.openLaunch\(/.test(
-          bootSrc
-        )
+        '折回来时减掉自己的窗口原点（预览落在哪块屏，取决于主窗口在哪）',
+        back &&
+          Math.abs(back.left - (1000 - 96 - 100) / 2) < 0.01 &&
+          Math.abs(back.top - (500 - 96 - 60) / 2) < 0.01,
+        JSON.stringify(back)
       );
       ok(
-        '来源坐标那一问是并行发出去的，不排在点亮窗口之前（不拖慢首帧）',
-        bootSrc.indexOf('const originPromise = api.launchOrigin()') <
-          bootSrc.indexOf('await api\n    .prepareLaunchWindow('),
-        `${bootSrc.indexOf('const originPromise = api.launchOrigin()')} / ${bootSrc.indexOf('await api\n    .prepareLaunchWindow(')}`
-      );
-
-      ok(
-        '窗口原点取自可用区（screenX/screenY 在无边框最大化窗口上不可信）',
-        /offsetX: Number\(screen\.availLeft\)/.test(launchSrc) &&
-          !/offsetX: window\.screenX/.test(launchSrc)
+        '拿不到窗口原点时按 (0,0) 折（不因此整段报废）',
+        viewportRectFrom(originRect, null, 2, viewSize)?.left === (1000 - 96) / 2
       );
       ok(
-        '动画前要等窗口长到目标尺寸（否则起点按旧尺寸算就偏了）',
-        /const target = launchWindowRect\(\);\s*await waitFor\(\s*\(\) =>\s*Math\.abs\(document\.documentElement\.clientWidth - target\.width\) <= 2/.test(
-          bootSrc
-        )
+        '来源在另一块屏时返回 null（宁可退化成中心放大，也别从画外被吸进来）',
+        viewportRectFrom(
+          { x: -2000, y: 100, width: 192, height: 192 },
+          { x: 0, y: 0 },
+          2,
+          viewSize
+        ) === null
       );
 
-      // 14.4 起点优先级的 Levels：元素 > 矩形 > 中心
-      viewer.open(2, null);
-      const probeRect = { left: 60, top: 40, width: 120, height: 96 };
+      // 14.4 预览窗口的开场时序：先切全屏（并**并行**预热首图）→ 等量到的视口
+      // 真的长到终态 → 才折几何 → 才播动画。顺序错了一样编译得过、跑得出，只是
+      // 起点会偏出屏幕、或者画面以空框起步。
+      ok(
+        '开场前先挂幕布（切全屏那几帧不是一片空白）',
+        bootSrc.indexOf('viewer.prime();') > 0 &&
+          bootSrc.indexOf('viewer.prime();') < bootSrc.indexOf('const framePromise')
+      );
+      ok(
+        '首图与「切全屏」并行取，不排在后面（那段转场本来就要等）',
+        bootSrc.indexOf('const framePromise = api.viewerReady()') <
+          bootSrc.indexOf('const imagePromise = viewer.preload(') &&
+          bootSrc.indexOf('const imagePromise = viewer.preload(') <
+            bootSrc.indexOf('const frame = await framePromise;')
+      );
+      ok(
+        '动画前要等视口真的长到终态（否则起点按旧尺寸算就偏了）',
+        /await waitFor\(settled, 8\);/.test(bootSrc) &&
+          bootSrc.indexOf('await waitFor(settled, 8);') <
+            bootSrc.indexOf('viewer.openLaunch(')
+      );
+      ok(
+        '首图的等待有上限（取不到也不能拖着不开场）',
+        /withTimeout\(imagePromise, FIRST_IMAGE_MS\)/.test(bootSrc)
+      );
+      ok(
+        '折几何排在量到布局之后、播动画之前',
+        bootSrc.indexOf('const rect = originRect') >
+          bootSrc.indexOf('await waitFor(settled') &&
+          bootSrc.indexOf('const rect = originRect') < bootSrc.indexOf('viewer.openLaunch(')
+      );
+      ok(
+        '等待期间按 Esc 能作废这次打开（否则按了又看着它自己弹出来）',
+        /if \(seq !== sessionSeq\) \{\s*viewer\.cancelPrime\(\);/.test(bootSrc)
+      );
+
+      // 14.5 起点优先级的三档：来源矩形 > 中心倍率 > 普通淡入
+      //
+      // 来源只有**矩形**一种形态了：预览窗口里没有网格，缩略图元素那一档随着
+      // 分家一起消失（视觉上仍是同一个 FLIP —— 主窗口把那一格折成屏幕坐标，
+      // 这里减掉自己的原点拿回来）。
+      viewer.openLaunch(2, null);
       const view = viewer.view();
-      const expectScale = probeRect.width / viewer.box.w;
-      const expectTx = probeRect.left + probeRect.width / 2 - view.w / 2;
-      const expectTy = probeRect.top + probeRect.height / 2 - view.h / 2;
+      // 来源矩形是**视口坐标**，而 stage 给顶栏/胶片条让了位 —— 折成 stage 坐标
+      // 之后才是能跟 `view()` 一起算的那一套。这里故意把那一格放在 stage 内部
+      // 一个已知偏移上，好让「折得对不对」有一个确切的期望值。
+      const stageBox = viewer.stage.getBoundingClientRect();
+      const probeRect = {
+        left: stageBox.left + 60,
+        top: stageBox.top + 40,
+        width: 120,
+        height: 96
+      };
+      const local = viewer.localRect(probeRect);
+      const expectScale = Math.max(local.width / viewer.box.w, local.height / viewer.box.h);
+      const expectTx = local.left + local.width / 2 - view.w / 2;
+      const expectTy = local.top + local.height / 2 - view.h / 2;
       const expectStart = `translate3d(${expectTx}px, ${expectTy}px, 0) scale(${expectScale})`;
 
       ok(
+        '起点先折成 stage 坐标（stage 并不是整个视口，差一个顶栏的高度）',
+        local &&
+          Math.abs(local.left - 60) < 0.01 &&
+          Math.abs(local.top - 40) < 0.01 &&
+          local.width === 120 &&
+          local.height === 96,
+        JSON.stringify(local)
+      );
+      ok(
+        '缩放按 cover 取（那一格是 object-fit: cover 裁的，按宽度对齐会矮一截）',
+        Math.abs(expectScale - Math.max(120 / viewer.box.w, 96 / viewer.box.h)) < 1e-9 &&
+          viewer.box.w * expectScale >= local.width - 0.01 &&
+          viewer.box.h * expectScale >= local.height - 0.01,
+        String(expectScale)
+      );
+      ok(
         '给了来源矩形就以它为 FLIP 起点',
-        viewer.zoomStart(null, { fromRect: probeRect }) === expectStart,
-        String(viewer.zoomStart(null, { fromRect: probeRect }))
+        viewer.zoomStart({ fromRect: probeRect }) === expectStart,
+        String(viewer.zoomStart({ fromRect: probeRect }))
+      );
+      // cover 之后画面会溢出那一格一点，裁掉溢出量才是「与缩略图逐像素相同」
+      const clip = viewer.clipFor(local);
+      const expectClip = `inset(40px ${view.w - 180}px ${view.h - 136}px 60px)`;
+      ok(
+        '裁切框正好是那一格（把 cover 溢出的部分裁掉）',
+        clip === expectClip,
+        `${clip} != ${expectClip}`
+      );
+      ok(
+        '没有来源矩形时没有裁切框（不留下一个歪掉的裁剪）',
+        viewer.clipFor(null) === null && viewer.clipFor({ width: 0, height: 0 }) === null
       );
       ok(
         '没有来源信息时从中心 0.8 倍起步',
-        viewer.zoomStart(null, { centerScale: CENTER_ZOOM_SCALE }) ===
+        viewer.zoomStart({ centerScale: CENTER_ZOOM_SCALE }) ===
           'translate3d(0px, 0px, 0) scale(0.8)'
       );
+      // 拿不到可用矩形（宽高为 0）时也算「没有来源」，退到倍率而不是硬算
       ok(
-        '缩略图元素优先于矩形参数（网格那条路不受影响）',
-        viewer.zoomStart(probeRect, {
-          fromRect: { left: 0, top: 0, width: 8, height: 8 }
-        }) === expectStart
+        '矩形不可用时退回中心倍率（不拿 0 宽高的矩形去算除法）',
+        viewer.zoomStart({
+          fromRect: { left: 0, top: 0, width: 0, height: 0 },
+          centerScale: CENTER_ZOOM_SCALE
+        }) === 'translate3d(0px, 0px, 0) scale(0.8)'
       );
       ok(
-        '三者都没有就退回普通淡入',
-        viewer.zoomStart(null, {}) === null
+        '两者都没有就退回普通淡入',
+        viewer.zoomStart({}) === null
       );
 
-      // 14.5 真实调用：无来源 → 中心 0.8 + 透明度渐变 + 沿用既有时长缓动
+      // 14.6 真实调用：无来源 → 中心 0.8 + 透明度渐变 + 沿用既有时长缓动
       await viewer.close();
       clearAnimations();
       viewer.openLaunch(2, null);
-      const launched = lastOf(viewer.slots[1]);
+      const launched = lastWith(viewer.slots[1], 'transform');
+      const launchedFade = lastWith(viewer.slots[1], 'opacity');
       ok(
         '无来源时首帧是中心 0.8 倍',
         launched?.keyframes?.transform?.[0] === 'translate3d(0px, 0px, 0) scale(0.8)',
@@ -1064,11 +1232,12 @@
         launched?.keyframes?.transform?.[1] === 'translate3d(0px, 0px, 0) scale(1)'
       );
       ok(
-        '开局带透明度渐变',
-        Array.isArray(launched?.keyframes?.opacity) &&
-          launched.keyframes.opacity[0] === 0 &&
-          launched.keyframes.opacity[1] === 1,
-        JSON.stringify(launched?.keyframes?.opacity)
+        '开局带透明度渐变（与位移等长、并行叠加）',
+        Array.isArray(launchedFade?.keyframes?.opacity) &&
+          launchedFade.keyframes.opacity[0] === 0 &&
+          launchedFade.keyframes.opacity[1] === 1 &&
+          launchedFade.options?.duration === launched?.options?.duration,
+        JSON.stringify(launchedFade?.keyframes?.opacity)
       );
       ok(
         '时长与缓动与现有预览动画一致',
@@ -1076,18 +1245,18 @@
         `${launched?.options?.duration} / ${launched?.options?.easing}`
       );
 
-      // 14.6 有来源 → 起点就是那一格
+      // 14.7 有来源 → 起点就是那一格
       await viewer.close();
       clearAnimations();
       viewer.openLaunch(2, probeRect);
-      const zoomed = lastOf(viewer.slots[1]);
+      const zoomed = lastWith(viewer.slots[1], 'transform');
       ok(
         '有来源矩形时首帧正是那一格的位置与大小',
         zoomed?.keyframes?.transform?.[0] === expectStart,
         String(zoomed?.keyframes?.transform?.[0])
       );
 
-      // 14.7 动画不等图片：调用一回来就已经在工作了，图片还没到
+      // 14.8 动画不等图片：调用一回来就已经在工作了，图片还没到
       ok(
         'openLaunch 同步返回，不等图片解码',
         viewer.isOpen === true && viewer.slots[1].__low.complete === false,
@@ -1106,7 +1275,7 @@
         String(rootEl.getAttribute('tabindex'))
       );
 
-      // 15.1 焦点不在「打开」那一刻抢 —— 那时图片还没到、窗口还在 maximize
+      // 15.1 焦点不在「打开」那一刻抢 —— 那时图片还没到、窗口还在进全屏
       document.body.focus();
       await viewer.close();
       viewer.openLaunch(2, null);
@@ -1196,7 +1365,7 @@
       // open() 期间手势被临时冻结（防 FLIP 与手势打架），备-手势前要等它恢复
       const tgOpen = async (index = 2) => {
         if (viewer.isOpen) await viewer.close();
-        viewer.open(index, null);
+        viewer.openLaunch(index, null);
         await new Promise((r) => setTimeout(r, 300));
         viewer.g.enabled = true;
         viewer.g.swipeX = 0;
@@ -1710,7 +1879,184 @@
       ok('17.15d 打断回弹本身不会误翻页', viewer.index === 2, String(viewer.index));
       await settle(300);
 
+      /* ---------- 18. 有来源 / 无来源必须是同一份开场 ---------- *
+       * 「图片墙点击」和「打开方式」以前各给 open() 配一套 options（一个有
+       * fadeIn、一个没有；一个带中心兜底、一个不带），于是同一个全屏预览悄悄
+       * 长成两种样子。现在两条路都汇到 `openFullscreen()`，区别只剩「来源矩形
+       * 有没有送到」—— 跨窗口传丢了就退化成中心放大，而不是变成另一种观感。
+       * 这里比对的是**真正传给 animate() 的实参**：静态检查只能看到源码里有
+       * 没有这个方法，看不到调用时传了什么。
+       *
+       * 虚拟时间下每渲染帧要吃掉一笔不小的预算（见 probe_gallery.mjs 说明），
+       * 所以这里只做两次「开—关」，不能像功能测试那样随便铺。 */
+
       await viewer.close();
+      await sleep(30);
+      // CENTER_ZOOM_SCALE 在 14 节已经 import 过（同一作用域）
+
+      /** 一次开场在关键帧 / 时长 / 缓动上留下的全部可比对信息 */
+      const openingOf = () => {
+        // 位移与透明度是两条并行动画，各取各的那一条
+        const slide = lastWith(viewer.slots[1], 'transform');
+        const fade = lastWith(viewer.slots[1], 'opacity');
+        const bg = lastOf(viewer.backdrop);
+        return {
+          from: slide?.keyframes?.transform?.[0] ?? '',
+          to: slide?.keyframes?.transform?.[1] ?? '',
+          fade: fade?.keyframes?.opacity?.[0] ?? null,
+          fadeDuration: fade?.options?.duration ?? null,
+          duration: slide?.options?.duration ?? null,
+          easing: slide?.options?.easing ?? null,
+          bgDuration: bg?.options?.duration ?? null
+        };
+      };
+
+      // 18.1 有来源：那一格经主窗口折成屏幕坐标、再折回这里的视口
+      clearAnimations();
+      viewer.openLaunch(2, { left: 60, top: 40, width: 120, height: 96 });
+      const viaRect = openingOf();
+      ok(
+        '18.1a 有来源时开场从那一格放大（起点不是 identity）',
+        /scale\([\d.]+\)/.test(viaRect.from) && viaRect.to.includes('scale(1)'),
+        viaRect.from
+      );
+      ok(
+        '18.1b 有来源时也带透明度渐变（与无来源那条一致）',
+        viaRect.fade === 0,
+        String(viaRect.fade)
+      );
+      ok(
+        '18.1c 时长 / 缓动与关闭切换共用同一份常量',
+        viaRect.duration === OPEN_MS && viaRect.easing === OPEN_EASE,
+        `${viaRect.duration} / ${viaRect.easing}`
+      );
+      ok('18.1d 遮罩背景同时淡入', viaRect.bgDuration > 0, String(viaRect.bgDuration));
+      ok(
+        '18.1e 两条路共用同一个切换实现（go / 手势都是 viewer 自己的）',
+        typeof viewer.go === 'function' &&
+          typeof viewer.openFullscreen === 'function' &&
+          typeof viewer.openLaunch === 'function'
+      );
+      await viewer.close();
+      await sleep(30);
+
+      // 18.2 来源没送到（跨窗口那趟折算出问题 / 冷启动没有光标位置）：
+      // 退化为屏幕中心放大，而不是「直接出现」，更不是变成另一种观感
+      clearAnimations();
+      viewer.openFullscreen(2, null);
+      const viaNothing = openingOf();
+      ok(
+        '18.2a 无来源时按中心倍率兜底',
+        viaNothing.from.includes(`scale(${CENTER_ZOOM_SCALE})`),
+        viaNothing.from
+      );
+      ok(
+        '18.2b 兜底的时长 / 缓动 / 渐变 / 背景与有来源那条逐项相同',
+        viaNothing.duration === viaRect.duration &&
+          viaNothing.easing === viaRect.easing &&
+          viaNothing.fade === viaRect.fade &&
+          viaNothing.bgDuration === viaRect.bgDuration,
+        `${viaNothing.duration}/${viaNothing.easing}/fade=${viaNothing.fade}/bg=${viaNothing.bgDuration}`
+      );
+      await viewer.close();
+      await sleep(30);
+
+      /* ---------------------------------------------------------------- *
+         19. 关闭时序：通知收窗口之前，画面必须已经淡完
+         ---------------------------------------------------------------- *
+
+         预览现在是独立窗口，收摊那一下后端会把它**整个销毁**（不动几何）。
+         所以要守的顺序变成了：画面先淡完 → 幕布退去 → 最后才通知。
+         顺序反了，用户看见的是画面「啪」地消失；通知多一次，主窗口就被叫醒
+         一次（那正是「退出预览后窗口被顶到最大化」的反面）。
+
+         静态检查只能看到「有没有这个出口」，看不到它排在动画前面还是后面。
+         这里跑一次真的关闭，在收摊**之前**那一刻把状态拍下来。
+      ------------------------------------------------------------------ */
+
+      const originPlayClose = viewer.playClose.bind(viewer);
+      const at = { opacity: null, hidden: null, backdrop: null, count: -1 };
+      let closeNotices = 0;
+      viewer.onClosed = () => {
+        closeNotices += 1;
+      };
+      viewer.playClose = async (options) => {
+        await originPlayClose(options);
+        // 此刻 finishClose() 还没跑：画面、幕布都还是它们在收摊前的样子
+        at.opacity = viewer.slots[1].style.opacity;
+        at.hidden = viewer.root.hidden;
+        at.backdrop = viewer.backdropOpacity;
+        at.count = animations.length;
+      };
+
+      clearAnimations();
+      viewer.openLaunch(1, null);
+      // 开场那批动画已播完，清掉；下面的记录只属于这一次关闭
+      clearAnimations();
+      await viewer.close();
+
+      const slideAnims = animations.filter(
+        (a) => a.el === viewer.slots[1] && a.keyframes?.transform
+      );
+      const rootFades = animations.filter(
+        (a) => a.el === viewer.root && a.keyframes?.opacity
+      );
+      const rootFadeIndex = animations.indexOf(rootFades[0]);
+
+      ok(
+        '19.1 通知之前画面已经淡完（窗口隐去时下面是全黑，不是半张图）',
+        at.opacity === '0',
+        String(at.opacity)
+      );
+      ok(
+        '19.2 那一刻幕布还盖着（预览仍是铺满的一整屏）',
+        at.hidden === false && at.backdrop > 0,
+        `hidden=${at.hidden} backdrop=${at.backdrop}`
+      );
+      // 记录到的是「收摊前已产生几条」，幕布那条必须排在它之前
+      ok(
+        '19.3 幕布退去排在收摊（也就是通知）之前',
+        rootFades.length === 1 && rootFadeIndex >= 0 && rootFadeIndex < at.count,
+        `root=${rootFades.length} idx=${rootFadeIndex} before=${at.count}`
+      );
+      ok(
+        '19.4 退的是根容器而不是背景层（根容器自带不透明背景）',
+        rootFades[0]?.el === viewer.root &&
+          rootFades[0]?.keyframes?.opacity?.[1] === 0,
+        JSON.stringify(rootFades[0]?.keyframes?.opacity)
+      );
+      ok(
+        '19.5 幕布比画面退场短（此时已无事可做，拖长只是干等）',
+        rootFades[0]?.options?.duration > 0 &&
+          rootFades[0]?.options?.duration < slideAnims[0]?.options?.duration,
+        `${rootFades[0]?.options?.duration} / ${slideAnims[0]?.options?.duration}`
+      );
+      ok('19.6 一次关闭只通知一次（叫两次会第二次点亮主窗口）', closeNotices === 1, String(closeNotices));
+      viewer.playClose = originPlayClose;
+      viewer.onClosed = () => {};
+
+      /* ---------- 20. 减少动态效果 ---------- */
+
+      const viewerSrc = await (await fetch('./js/viewer.js')).text();
+
+      // 系统辅助功能开了「减少动态效果」之后，缩放位移应当让位给短淡入淡出。
+      // 这里直接换掉 media query 的判定结果来验两条分支。
+      ok(
+        '20.1 转场时长与 FLIP 都挂在「减少动态效果」开关上',
+        /const motionMs = \(ms\) => \(motionOK\(\) \? ms : REDUCED_MS\);/.test(
+          viewerSrc
+        ) && /const useFlip = motionOK\(\) && target/.test(viewerSrc)
+      );
+      ok(
+        '20.2 关闭时的淡出用分段缓动（不是整段 linear 的硬拐点）',
+        /opacity: \[1, 1, 0\], offset: \[0, 0\.55, 1\]/.test(viewerSrc) &&
+          /easing: \['linear', 'ease-out'\]/.test(viewerSrc)
+      );
+      ok(
+        '20.3 转场期间才挂 will-change，跑完撤掉（不留常驻合成层）',
+        /el\.style\.willChange = 'transform, opacity';/.test(viewerSrc) &&
+          /el\.style\.willChange = '';/.test(viewerSrc)
+      );
 
       } catch (error) {
         log.push(`THREW ${error && error.stack ? error.stack.split('\n')[0] : String(error)}`);

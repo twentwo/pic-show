@@ -124,79 +124,16 @@
       </div>
     </section>
 
-    <!-- ===================== 全屏查看器 ===================== -->
     <!--
-      tabindex="-1"：预览视图要能**被程序聚焦**但不进入 Tab 遍历。
-      「打开方式」启动时窗口是隐藏建起来的，webview 不是第一响应者，
-      不显式抢一次焦点，方向键就得等用户先点一下画面（见 Viewer#focusView）。
+      预览（灯箱）**不在这个页面里**。
+
+      它是独立的 `viewer` 窗口，DOM 住在 `viewer.html`，逻辑住在
+      `ui/js/viewer-main.js`。两个 webview 之间没有共享的 JS 上下文，图片集合
+      只能经后端中转（见 `api.openViewer` / `commands::viewer_boot`）。
+
+      换来的是：这条窗口**一次全屏都没进过、一次几何都没被写过**。退出预览
+      后它回到原样，靠的不是「还原得准」，而是**从来没被改过**。
     -->
-    <div id="viewer" class="viewer" tabindex="-1" hidden>
-      <div class="viewer-backdrop"></div>
-      <div class="viewer-stage"></div>
-
-      <div class="viewer-chrome">
-        <!--
-          标题栏。沉浸式预览下窗口装饰被关掉，这就是屏幕上唯一的标题栏：
-          左边关闭、中间文件名与序号、右边工具，空白处可拖动窗口。
-          它的显隐与下面「上一张/下一张」按钮、底部胶片条共用同一套计时。
-        -->
-        <div id="viewer-bar" class="viewer-bar">
-          <button class="icon-btn viewer-close" type="button" title="关闭 (Esc)" aria-label="关闭">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6 L18 18 M18 6 L6 18" /></svg>
-          </button>
-
-          <div class="viewer-meta">
-            <span id="viewer-title" class="viewer-title"></span>
-            <span id="viewer-counter" class="viewer-counter"></span>
-          </div>
-
-          <div class="viewer-drag" data-tauri-drag-region></div>
-
-          <div class="viewer-tools">
-            <button class="icon-btn zoom-out" type="button" title="缩小 (-)" aria-label="缩小">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" /></svg>
-            </button>
-            <button id="viewer-zoom" class="viewer-zoom" type="button" title="适应窗口 (0)">100%</button>
-            <button class="icon-btn zoom-in" type="button" title="放大 (+)" aria-label="放大">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v12M6 12h12" /></svg>
-            </button>
-            <button class="icon-btn reveal" type="button" title="在文件管理器中显示" aria-label="在文件管理器中显示">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h5l2 2h9v10H4z" /></svg>
-            </button>
-            <!-- 沉浸式预览下顶栏是隐藏的，所以主题开关必须在预览界面里也有一份 -->
-            <button
-              id="btn-theme-viewer"
-              class="icon-btn theme-toggle"
-              type="button"
-              title="切换到浅色主题"
-              aria-label="切换到浅色主题"
-            >
-              <svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
-                <circle cx="12" cy="12" r="4.2" />
-                <path
-                  d="M12 2.6v2.4M12 19v2.4M2.6 12h2.4M19 12h2.4M5.4 5.4l1.7 1.7M16.9 16.9l1.7 1.7M18.6 5.4l-1.7 1.7M7.1 16.9l-1.7 1.7"
-                />
-              </svg>
-              <svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M20.2 14.6A8.6 8.6 0 0 1 9.4 3.8a7.3 7.3 0 1 0 10.8 10.8z" />
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        <button class="nav-btn prev" type="button" title="上一张 (←)" aria-label="上一张">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5 L8 12 L15 19" /></svg>
-        </button>
-        <button class="nav-btn next" type="button" title="下一张 (→)" aria-label="下一张">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5 L16 12 L9 19" /></svg>
-        </button>
-
-        <!-- 胶片条：缩略图列表，点击直接跳转 -->
-        <div id="viewer-strip" class="viewer-strip">
-          <div id="strip-inner" class="strip-inner"></div>
-        </div>
-      </div>
-    </div>
 
     <!-- 仅在「用普通浏览器打开开发服务器」时出现 -->
     <div id="host-warning" class="host-warning" hidden>

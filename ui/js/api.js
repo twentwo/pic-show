@@ -2,9 +2,16 @@
  * 后端 API 门面：命令调用 + 图片地址构造 + 前端解码缓存。
  */
 
-import { invoke, listen, isTauri, showWindow, setWindowTitle } from './tauri.js';
+import {
+  invoke,
+  listen,
+  isTauri,
+  platform,
+  showWindow,
+  setWindowTitle
+} from './tauri.js';
 
-export { isTauri, showWindow, setWindowTitle };
+export { isTauri, platform, showWindow, setWindowTitle };
 
 /* ------------------------------------------------------------------ *
  * 图片地址（由 src-tauri/src/protocol.rs 提供）
@@ -84,10 +91,11 @@ export const launchDecisionBudget = () =>
     invoke('launch_decision_budget').catch(() => 0);
 
 /**
- * 把键盘焦点交给主窗口（「打开方式」启动用）。
+ * 把键盘焦点交给主窗口。
  *
- * 必须在「窗口已显示」且「首图已落地」之后调用：隐藏窗口上要焦点会被平台
- * 忽略，maximize 又会把它让出去 —— 早一步设，用户就得先点一下画面。
+ * 必须在「窗口已显示」之后调用：窗口是隐藏启动的，隐藏窗口上要焦点会被平台
+ * 直接忽略。预览窗口也有自己那份（{@link focusViewer}）—— 两条窗口各自的焦点
+ * 归各自的命令管，名字分开才不会指错人。
  */
 export const focusWindow = () => invoke('focus_window').catch(() => {});
 
@@ -99,31 +107,76 @@ export const focusWindow = () => invoke('focus_window').catch(() => {});
  */
 export const launchOrigin = () => invoke('launch_origin').catch(() => null);
 
-/**
- * 「打开方式」专用：一步到位把窗口变成沉浸式全屏并点亮。
+/* ------------------------------------------------------------------ *
+ * 预览窗口
  *
- * 常规入口是「先显示主界面 → 前端再决定要不要进预览」，中间那几帧用户看得见。
- * 这条路径在窗口还藏着的时候就把形态与尺寸定好，亮起来已经是全屏。
+ * 预览是**独立的物理窗口**，与主窗口之间隔着两个 webview —— 没有共享的 JS
+ * 上下文，图片集合与来源几何只能经后端中转。
+ * ------------------------------------------------------------------ */
+
+/**
+ * 打开预览：把会话交给后端，由预览窗口自己全屏亮起来。
+ *
+ * 这里是**唯一**的入口：图片墙点击、图片墙回车、「打开方式」三条路都从这儿
+ * 过，所以「这几个入口的预览是否一致」在代码上没有第二种答案。
+ *
+ * 主窗口因此一次都不用切全屏 —— 那才是「退出预览后回到原尺寸」的根本：
+ * 不是「还原得准」，而是**从来没被改过**。
+ *
+ * @param {number} index 停在第几张
+ * @param {?{x:number,y:number,width:number,height:number}} origin 开场动画起点
+ *   （物理像素、屏幕坐标系）；拿不到传 null，预览会退化为屏幕中心放大
+ * @param {boolean} immersive 「打开方式」来的会话（关闭即退出应用）
+ * @returns {Promise<boolean>} 预览有没有被发起。
  */
-export const prepareLaunchWindow = (rect) =>
-    invoke('prepare_launch_window', { rect });
+export const openViewer = (index, origin, immersive) =>
+  invoke('open_viewer', { index, origin, immersive }).catch(() => false);
+
+/** 预览取走自己的会话；取不到说明这次还没人开预览，进入待命。 */
+export const viewerBoot = () => invoke('viewer_boot').catch(() => null);
+
+/** 预告「我可以收事件了」，让后端把装配那几帧里攒下的请求补送过来。 */
+export const viewerListening = () =>
+  invoke('viewer_listening').catch(() => null);
+
+/**
+ * 切进全屏并回报窗口原点（物理像素、屏幕坐标系）。
+ *
+ * 原点用来把来源矩形折成预览自己的视口坐标：全屏窗口落在哪块屏取决于主窗口
+ * 在哪块屏，视口原点因此未必是 (0,0)。
+ */
+export const viewerReady = () => invoke('viewer_ready').catch(() => null);
+
+/** 关闭预览：预览窗口被真正销毁，并把「用户在看第几张」送回主窗口。 */
+export const closeViewer = (index) =>
+  invoke('close_viewer', { index }).catch(() => null);
+
+/** 把键盘焦点交给预览窗口（首图落地之后才有用）。 */
+export const focusViewer = () => invoke('focus_viewer').catch(() => null);
+
+/**
+ * 主窗口左上角在屏幕坐标系里的位置（物理像素）。
+ *
+ * 主窗口要把「第 N 格缩略图」的位置交给预览当动画起点，而
+ * `getBoundingClientRect()` 给的是视口坐标 —— 加上自己的原点才是两个窗口都
+ * 读得懂的屏幕坐标。
+ */
+export const windowOrigin = () => invoke('window_origin').catch(() => null);
+
+/** 已经开着的预览要换到另一张（用户在预览开着时又从 Finder 打开了一张）。 */
+export const onViewerGoto = (handler) =>
+  listen('picshow://viewer-goto', (event) => handler(event.payload));
+
+/** 预览关掉了，主窗口据此把网格滚到用户最后看的那一张。 */
+export const onViewerClosed = (handler) =>
+  listen('picshow://viewer-closed', (event) => handler(event.payload));
 
 /** 退出应用：沉浸式预览关闭后应当彻底退出，回到文件管理器 */
 export const exitApp = () => invoke('exit_app');
 
 /* ------------------------------------------------------------------ *
- * 窗口形态与主题
+ * 主题
  * ------------------------------------------------------------------ */
-
-/**
- * 沉浸式窗口形态：关掉系统绘制的原生标题栏。
- *
- * 原生标题栏的颜色 / 毛玻璃由系统画，跟预览背景永远对不齐，也不受前端
- * 空闲计时的控制（没法跟着按钮和胶片条一起隐藏）。关掉它之后，页面里
- * 那条 `.viewer-bar` 就是唯一标题栏 —— 背景同源、显隐同步。
- */
-export const setImmersiveChrome = (enabled) =>
-    invoke('set_immersive_chrome', { enabled });
 
 /**
  * 把用户选的主题同步给原生窗口（文件对话框这类系统UI不听 CSS 的话）。

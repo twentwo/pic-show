@@ -1,6 +1,6 @@
 [package]
 name = "picshow"
-version = "0.1.2"
+version = "0.1.3"
 description = "PicShow - 沉浸式跨平台照片查看器"
 authors = ["PicShow"]
 edition = "2021"
@@ -36,6 +36,12 @@ rayon = "1"
 walkdir = "2"
 # 锁
 parking_lot = "0.12"
+
+# macOS 专用：给无边框窗口补回原生全屏能力（详见 src/macos.rs）。
+# 版本跟着 tao 内部用的那份走，属于同一个已编译依赖，不会带来额外构建成本。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSWindow"] }
 
 [profile.release]
 codegen-units = 1

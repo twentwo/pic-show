@@ -131,7 +131,18 @@ test('mapBoxToRect 起点矩形能精确映射回缩略图位置', () => {
     Math.abs(center.y - (rect.top + rect.height / 2)) < 0.01,
     `中心 y 偏移: ${center.y}`
   );
-  assert.ok(Math.abs(BASE.w * scale - rect.width) < 0.01, '宽度映射不符');
+  // 缩放按 **cover** 取：那一格是 `object-fit: cover` 裁出来的，起点必须把它
+  // 铺满（溢出量由调用方用 clip-path 裁掉），按宽度对齐会矮一截。
+  const byWidth = rect.width / BASE.w;
+  const byHeight = rect.height / BASE.h;
+  assert.ok(
+    Math.abs(scale - Math.max(byWidth, byHeight)) < 1e-9,
+    `缩放应取两方向的大值: ${scale}`
+  );
+  assert.ok(
+    BASE.w * scale >= rect.width - 0.01 && BASE.h * scale >= rect.height - 0.01,
+    'cover 之后两个方向都得盖住那一格'
+  );
 });
 
 test('isMostlyVertical 判定下拉手势方向', () => {

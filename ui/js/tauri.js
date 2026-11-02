@@ -14,6 +14,24 @@ export const isTauri = Boolean(
 );
 
 /**
+ * 运行平台：`macos` / `windows` / `linux`，拿不到时为空串。
+ *
+ * 只用来做**布局避让**这一件事：macOS 的交通灯画在窗口左上角，会压住页面顶部
+ * 靠左的内容，需要给它让出位置；另外两个平台没有这个东西。
+ */
+export const platform = (() => {
+  if (typeof navigator === 'undefined') return '';
+  const raw =
+    (navigator.userAgentData && navigator.userAgentData.platform) ||
+    navigator.platform ||
+    '';
+  if (/mac/i.test(raw)) return 'macos';
+  if (/win/i.test(raw)) return 'windows';
+  if (/linux|x11/i.test(raw)) return 'linux';
+  return '';
+})();
+
+/**
  * 调用后端命令，返回 Promise。
  *
  * 非 Tauri 环境下（比如有人直接在浏览器里打开了开发服务器地址）拒绝并给出

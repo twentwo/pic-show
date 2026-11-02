@@ -13,7 +13,7 @@ use std::{
 use moka::sync::Cache;
 use parking_lot::RwLock;
 
-use crate::model::{ImageItem, LaunchOrigin, LaunchPayload};
+use crate::model::{ImageItem, LaunchOrigin, LaunchPayload, ViewerRequest};
 
 /// 内存缓存上限（字节）。缩略图/占位图体积都很小，256MB 足够覆盖几千张。
 const MEM_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -25,6 +25,15 @@ pub struct AppState {
     items: RwLock<HashMap<u32, ImageItem>>,
     /// id -> 绝对路径
     paths: RwLock<HashMap<u32, PathBuf>>,
+    /**
+     * 当前集合，按**扫描顺序**保留。
+     *
+     * 注册表本身是 `HashMap`，遍历顺序不确定 —— 而预览是另一个窗口，它拿到的
+     * 图片集合必须与主窗口**同序**，否则「预览里翻到第 5 张、退出后图片墙滚到
+     * 的第 5 张」指的根本不是同一张。所以有序列表单独存一份，两个窗口都从这
+     * 一份取。
+     */
+    current: RwLock<Vec<ImageItem>>,
     /// 变体缓存：key(`thumb:360:12`) -> 编码后的字节
     mem: Cache<String, Arc<Vec<u8>>>,
     cache_dir: RwLock<Option<PathBuf>>,
@@ -42,8 +51,35 @@ pub struct AppState {
     launched: AtomicBool,
     /// 目标文件名（用于窗口标题）。
     launch_title: RwLock<Option<String>>,
-    /// 是否处于沉浸式预览（无原生标题栏，画面铺满窗口）。
-    immersive: AtomicBool,
+    /**
+     * 预览窗口待取的那一份会话。
+     *
+     * 预览是**独立的物理窗口**，它的 webview 与主窗口不共享 JS 上下文，所以
+     * 「打开哪一张、从哪一格长出来、关掉要不要退出」这三件事只能先存在这里，
+     * 等预览窗口自己装配好了来取。取走即清空 —— 免得下次预览继承了上一次的
+     * 陈旧入口。
+     */
+    viewer_request: RwLock<Option<ViewerRequest>>,
+    /**
+     * 预览窗口是否已经装配到能收事件了。
+     *
+     * 冷启动时两个窗口的 webview 一起开始加载，谁先跑完是不确定的。主窗口
+     * 先跑完就直接发事件，而预览那边监听还没注册上 —— 事件直接掉进黑洞。
+     * 所以由预览自己喊一声「我好了」，主窗口据此决定是发事件还是把请求存着。
+     *
+     * 预览窗口退出时会被**销毁**，这个标志必须随之置 false（`release_viewer` /
+     * `ensure_viewer_window`）；重建后的新窗口会重新上报一次，否则请求会被发给
+     * 一条已经不存在的 webview。
+     */
+    viewer_listening: AtomicBool,
+    /**
+     * 预览会话的世代号：每发起一次预览就 +1。
+     *
+     * 「销毁预览窗口」要等 `Destroyed` 事件把 label 从注册表移除。这段确认里
+     * 用户完全可以再点一张图：那时让位线程手里的「这次让位」已经过期，照着做
+     * 会把刚重建的窗口又盖住。用世代号让过期的让位自己作废。
+     */
+    viewer_epoch: AtomicU64,
     /// 「从文件管理器打开」时那张缩略图的近似位置（见 `model::LaunchOrigin`）。
     ///
     /// 由 `commands::capture_launch_origin` 在**后台线程**里补写，可能比前端
@@ -68,6 +104,7 @@ impl Default for AppState {
             next_id: AtomicU32::new(1),
             items: RwLock::new(HashMap::new()),
             paths: RwLock::new(HashMap::new()),
+            current: RwLock::new(Vec::new()),
             mem: Cache::builder()
                 .weigher(|_key, value: &Arc<Vec<u8>>| value.len() as u32)
                 .max_capacity(MEM_CACHE_BYTES)
@@ -79,7 +116,9 @@ impl Default for AppState {
             ready: AtomicBool::new(false),
             launched: AtomicBool::new(false),
             launch_title: RwLock::new(None),
-            immersive: AtomicBool::new(false),
+            viewer_request: RwLock::new(None),
+            viewer_listening: AtomicBool::new(false),
+            viewer_epoch: AtomicU64::new(0),
             launch_origin: RwLock::new(None),
             started: Instant::now(),
         }
@@ -102,7 +141,17 @@ impl AppState {
     pub fn replace(&self, paths: Vec<PathBuf>) -> Vec<ImageItem> {
         self.items.write().clear();
         self.paths.write().clear();
-        self.register(paths)
+        let out = self.register(paths);
+        *self.current.write() = out.clone();
+        out
+    }
+
+    /// 当前图片集合（与扫描顺序一致）。
+    ///
+    /// 两个窗口的「第 N 张」必须是同一张，所以谁都不许自己遍历注册表 ——
+    /// 那边是 `HashMap`，顺序不确定。
+    pub fn all_items(&self) -> Vec<ImageItem> {
+        self.current.read().clone()
     }
 
     fn register(&self, paths: Vec<PathBuf>) -> Vec<ImageItem> {
@@ -172,16 +221,38 @@ impl AppState {
         self.launch_title.read().clone()
     }
 
-    /// 切到 / 退出沉浸式预览（无原生标题栏）。
-    ///
-    /// 由前端在打开大图前设置，后端据此在窗口显示前就把装饰关掉 ——
-    /// 亮起来之后再改形态，用户会看见标题栏「出现又消失」的跳动。
-    pub fn set_immersive(&self, enabled: bool) {
-        self.immersive.store(enabled, Ordering::Relaxed);
+    /**
+     * 存一份预览请求，等预览窗口来取。
+     *
+     * 后到的请求直接覆盖先到的：用户在预览还开着的时候又从 Finder 打开了另一
+     * 张，语义就是「换到那一张」，而不是「再开一个预览窗口」。
+     */
+    pub fn set_viewer_request(&self, request: ViewerRequest) {
+        *self.viewer_request.write() = Some(request);
     }
 
-    pub fn is_immersive(&self) -> bool {
-        self.immersive.load(Ordering::Relaxed)
+    /// 取走预览请求（取完即清空）。
+    pub fn take_viewer_request(&self) -> Option<ViewerRequest> {
+        self.viewer_request.write().take()
+    }
+
+    /// 预览窗口已装配到能收事件。
+    pub fn set_viewer_listening(&self, enabled: bool) {
+        self.viewer_listening.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_viewer_listening(&self) -> bool {
+        self.viewer_listening.load(Ordering::Relaxed)
+    }
+
+    /// 发起一次预览：世代号 +1，并返回新值（让位线程据此判断自己过没过期）。
+    pub fn bump_viewer_epoch(&self) -> u64 {
+        self.viewer_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// 当前世代号。
+    pub fn viewer_epoch(&self) -> u64 {
+        self.viewer_epoch.load(Ordering::Relaxed)
     }
 
     /// 存一份待处理的「系统要求打开」请求。

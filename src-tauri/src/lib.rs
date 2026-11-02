@@ -15,6 +15,11 @@ mod protocol;
 mod scanner;
 mod state;
 
+// macOS 的无边框窗口缺原生全屏能力，得写一小段 AppKit 才补得回来。
+// 其它平台不需要这一段，`cargo check` 也不会去看它。
+#[cfg(target_os = "macos")]
+mod macos;
+
 use std::path::PathBuf;
 
 use tauri::{Listener, Manager};
@@ -42,16 +47,51 @@ pub fn run() {
             commands::take_launch_target,
             commands::launch_origin,
             commands::launch_decision_budget,
-            commands::prepare_launch_window,
+            commands::open_viewer,
+            commands::viewer_listening,
+            commands::viewer_boot,
+            commands::viewer_ready,
+            commands::close_viewer,
+            commands::focus_viewer,
+            commands::window_origin,
             commands::focus_window,
             commands::reveal_image,
             commands::cache_stats,
             commands::log_error,
             commands::window_ready,
             commands::exit_app,
-            commands::set_immersive_chrome,
             commands::set_window_theme,
         ])
+        // 窗口事件：预览窗口的原生关闭请求要转成**前端那条正常关闭路径**。
+        //
+        // 用户点红色交通灯 / 按 `Cmd+W` 时默认行为是直接销毁窗口，那样就没机会
+        // 播退场动画、把「看到第几张」送回图片墙、或让沉浸式会话一并退出应用。
+        // 所以在这里拦下来交给前端；前端收摊后调 `close_viewer`，后端再
+        // `destroy()` 真正销毁。Esc、双击、关闭按钮、交通灯四条路径因此完全
+        // 一致。
+        //
+        // `destroy()` 不触发 `CloseRequested`（强制关闭、不发事件），不会绕圈。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != commands::VIEWER_LABEL {
+                    return;
+                }
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                std::thread::spawn(move || {
+                    let viewer = app.get_webview_window(commands::VIEWER_LABEL);
+                    // eval 失败（webview 已经不在了）就自己在后端销毁窗口，不能
+                    // 让一条既关不掉又占着全屏的窗口留在层级里。
+                    let handed = viewer
+                        .as_ref()
+                        .map(|w| w.eval("window.__picshowRequestClose?.()"))
+                        .unwrap_or(Ok(()));
+                    if handed.is_err() {
+                        commands::release_viewer(&app);
+                    }
+                });
+            }
+        })
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -60,13 +100,43 @@ pub fn run() {
             let _ = std::fs::create_dir_all(&data_dir);
             app.state::<AppState>().set_cache_dir(data_dir);
 
+            // 窗口样式在**启动阶段**跑一次：那时图片墙与首条预览窗口都在
+            // （两条都在 `tauri.conf.json` 里声明），一次遍历全部设好。
+            //
+            // 预览窗口退出即销毁，重建时 `ensure_viewer_window` 会再跑一次；函数
+            // 会跳过已经设过的窗口，所以**每条窗口一生仍只被设定一次**，绝不在
+            // 运行时改动已存在窗口的样式 —— 这是「退出预览后窗口停在最大化、
+            // 标题栏回不来」那类故障的根治办法：只要在运行时切换过「有没有标题
+            // 栏」，窗口层就会记下一份「退出全屏时照着恢复」的样式，并在每次退出
+            // 时无条件写回它。不动它，就没有这条覆盖链。
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                if let Err(e) =
+                    handle.run_on_main_thread(crate::macos::apply_immersive_frame)
+                {
+                    eprintln!("[picshow] 投递窗口样式设定失败: {e}");
+                }
+            }
+
             // 窗口是隐藏启动的，等前端首屏装配完再点亮（见 commands::window_ready）。
             // 这里再补一道兜底：万一前端因脚本报错没能上报就绪，宁可闪一下
             // 也不能让用户对着一个隐身的窗口发呆。
+            //
+            // 但**预览已经接管时绝不能插手**：那是「打开方式」的冷启动路径，
+            // 主界面从头到尾都不该露面。少了这道判断，用户会在看第三张图的
+            // 时候被一张图片墙盖住屏幕。
             let fallback = app.handle().clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(3000));
-                if let Some(window) = fallback.get_webview_window("main") {
+                let viewer_up = fallback
+                    .get_webview_window(commands::VIEWER_LABEL)
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(false);
+                if viewer_up {
+                    return;
+                }
+                if let Some(window) = fallback.get_webview_window(commands::MAIN_LABEL) {
                     if !window.is_visible().unwrap_or(false) {
                         commands::reveal_main_window(&fallback);
                     }
@@ -122,6 +192,13 @@ pub fn run() {
             if !paths.is_empty() {
                 commands::deliver_launch(handle, paths);
             }
+            return;
+        }
+        // 退出路径的兜底：无论因为什么退出（主窗口关掉、Dock 菜单退出、系统
+        // 关机），都先销毁预览窗口。进程一死 AppKit 也会回收那个全屏桌面，但
+        // 先销毁窗口能让退出那一瞬不闪出常规尺寸的空白窗口帧。
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            commands::release_viewer_now(handle);
         }
     });
 }

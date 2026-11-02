@@ -42,14 +42,28 @@ export class Strip {
     this.mounted = new Map();
     this.metrics = measure();
 
-    this.root.addEventListener('click', (event) => {
+    this._onClick = (event) => {
       const node = event.target?.closest?.('.strip-item');
       if (node) this.onJump?.(Number(node.dataset.index));
-    });
+    };
+    this.root.addEventListener('click', this._onClick);
 
     this._resizeRaf = 0;
     this._ro = new ResizeObserver(() => this.scheduleResize());
     this._ro.observe(this.root);
+  }
+
+  /**
+   * 彻底拆掉：预览层要能被完整卸载，观察者与监听器不能留在那儿继续回调
+   * （它们在元素已经不参与布局之后仍会每个尺寸变化都算一遍窗口）。
+   */
+  destroy() {
+    this._ro?.disconnect();
+    if (this._resizeRaf) cancelAnimationFrame(this._resizeRaf);
+    this._resizeRaf = 0;
+    this.root.removeEventListener('click', this._onClick);
+    this.mounted.clear();
+    this.items = [];
   }
 
   get count() {

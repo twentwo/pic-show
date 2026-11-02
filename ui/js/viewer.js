@@ -29,6 +29,7 @@ import {
   revealImage
 } from './api.js';
 import { fitBox, clamp, mapBoxToRect } from './geometry.js';
+import { withTimeout } from './async.js';
 import { Gestures } from './gestures.js';
 import { CENTER_ZOOM_SCALE } from './launch.js';
 import { Strip } from './strip.js';
@@ -40,7 +41,44 @@ import {
   installChromeTokens
 } from './chrome.js';
 
+/** 位移动画（轨道切换这类「已经在同一屏里挪一挪」）用的缓动：起步快、尾段长 */
 const EASE = 'cubic-bezier(0.22, 1, 0.36, 1)';
+/**
+ * **跨窗口那一次转场**专用的缓动：起步慢一点、全程减速、不过冲。
+ *
+ * 不能沿用 `EASE`：那条曲线前 20% 就走完大半程，用在「从缩略图长到整屏」上
+ * 就是「啪」地弹开 —— 它适合元素在同一屏里挪动，不适合一次跨越两个窗口的
+ * 变形。这里要的是 iOS 相册那种曲线：开头有一点从容的加速，之后一路减速收
+ * 尾，末端不越过终点（过冲会让画面在最后一帧抖一下）。
+ */
+const MORPH_EASE = 'cubic-bezier(0.32, 0.72, 0, 1)';
+/**
+ * 转场里透明度专用的缓动。
+ *
+ * 与位移分开不是多此一举：`EASE` 那种「前段猛冲」的曲线用在淡入上，会让
+ * 画面在前 20% 就亮了大半，观感是「啪」地跳出来；透明度要的是匀速或缓出。
+ * 以前这里混着 `linear` / `ease-out` / `EASE` 三种，同一种淡入在不同入口
+ * 上是三种节奏。
+ *
+ * 名字带 `TWEEN_` 是为了和下面那个 `FADE_EASE` 区分开：后者属于**控件层**
+ * （标题栏 / 按钮 / 胶片条的显隐），这一条属于**转场**，两者各管一段，别混。
+ */
+const TWEEN_FADE_EASE = 'linear';
+/**
+ * 「减少动态效果」开关（系统辅助功能）。
+ *
+ * 开着的时候不做缩放位移，只留一段很短的淡入淡出 —— 完全去掉动画会让
+ * 「预览开了 / 关了」这件事失去提示，反而更难用。
+ */
+const REDUCED_MS = 120;
+const reduceMotionQuery =
+  typeof window.matchMedia === 'function'
+    ? window.matchMedia('(prefers-reduced-motion: reduce)')
+    : null;
+/** 当前该不该播带位移的转场 */
+const motionOK = () => !reduceMotionQuery?.matches;
+/** 把一段时长按「减少动态效果」换算 */
+const motionMs = (ms) => (motionOK() ? ms : REDUCED_MS);
 /**
  * 静止多久后自动隐藏控件。
  * 导出给 `ui/probe.html` 用 —— 探针要等这个时长，硬编码一份迟早会漂移。
@@ -55,11 +93,38 @@ const DOUBLE_TAP_SCALE = 2.6;
 /**
  * 展开动画的时长与缓动。导出是为了让探针能核对「启动动画与预览已有的
  * 转场是同一套参数」—— 硬编码一份去比对，迟早会漂。
+ *
+ * 时长取 380ms 而不是常见的 300：这次变形要跨过两个窗口（那边刚点亮、这边才
+ * 开始长），中间还夹着一段平台转场，短了就像「闪一下就到位」，长了又拖沓。
+ * 380ms 是「看得清它是从哪儿来的，又不等人」的那个点。
  */
-export const OPEN_EASE = EASE;
-/** 转场时长 */
-export const OPEN_MS = 340;
-const CLOSE_MS = 300;
+export const OPEN_EASE = MORPH_EASE;
+export const OPEN_MS = 380;
+/**
+ * 关闭时长。比开场短一档：退出是「还回去」，用户已经知道画面要去哪儿，
+ * 拖长只是等。缓动与开场同一条，来回才是同一次运动。
+ */
+const CLOSE_MS = 320;
+/** 背景淡入淡出与画面**同长同缓动** —— 以前背景是各自硬编码的 280 / 200，
+ *  于是「画面到了、背景还没到」在两个方向上各撕开一点。 */
+const BACKDROP_OPEN_MS = OPEN_MS;
+/** 关闭时幕布退去那一段。比画面短一点：此刻已无事可做，拖长了只是干等。 */
+const CURTAIN_MS = 180;
+/**
+ * 单段动画的等待上限。
+ *
+ * `animation.finished` 在渲染帧停摆（窗口转场、最小化、切走 Space）时不会
+ * 兑现，直接 await 它等于把关闭流程交给「浏览器什么时候高兴」决定。
+ */
+const ANIM_SLACK_MS = 400;
+/**
+ * 幕布的保险丝时长。
+ *
+ * 幕布是「点击反馈」，不是状态。挂上之后若迟迟没有 `open()` 接手（形态切不
+ * 过去、IPC 挂住、预览正忙被拒），它会自己撤掉 —— 一层不透明的全屏遮罩留在
+ * 屏幕上，看起来就是整个程序死了。
+ */
+const PRIME_FUSE_MS = 4000;
 /** 左右切换：轨道位移时长 */
 const SWITCH_MS = 300;
 /**
@@ -79,17 +144,27 @@ export class Viewer {
   /**
    * @param {object} opts
    * @param {HTMLElement} opts.root #viewer
-   * @param {import('./grid.js').Grid} opts.grid
    * @param {(message:string)=>void} opts.onError
-   * @param {()=>void} opts.onExit 关闭后是否退出应用（沉浸式预览用）
+   * @param {()=>void} opts.onClosed 每次关闭 / 取消完成后回调。
+   *   **唯一的收尾出口** —— 「这次预览要不要连带退出应用」由调用方在它里面
+   *   决定（它才知道这次会话是不是从文件管理器来的）。Viewer 自己只管把画面
+   *   收干净。
    */
-  constructor({ root, grid, onError = () => {}, onExit = () => {} }) {
+  constructor({ root, onError = () => {}, onClosed = () => {} }) {
     this.root = root;
-    this.grid = grid;
     this.onError = onError;
-    this.onExit = onExit;
-    /** 沉浸式：关闭 = 退出应用（从文件管理器唤起时） */
-    this.exitOnClose = false;
+    this.onClosed = onClosed;
+    /**
+     * 开场动画的起点 / 退场动画的落点（**本窗口视口坐标系**）。
+     *
+     * 预览是独立窗口，网格那一格在**另一个 webview** 里 —— 这里拿不到它的
+     * DOM，也就无法在关闭时再去问「这一格现在在哪」。所以来源矩形在开场时
+     * 记下来，关闭动画原路缩回去。
+     *
+     * 翻了页也不更新：那时用户看的是另一张，缩回「最初点开的那一格」仍是
+     * 唯一说得通的落点（那一格在另一个窗口里，我们既看不到也改不动）。
+     */
+    this.originRect = null;
     /** 首尾是否循环；false = 禁用并给回弹提示 */
     this.loop = false;
 
@@ -206,7 +281,7 @@ export class Viewer {
   /**
    * 首图落地之后再把焦点交给预览视图。
    *
-   * 不早设的理由很实在：点亮窗口之后还有 maximize、布局落定这几帧，它们会
+   * 不早设的理由很实在：点亮窗口之后还有全屏切换、布局落定这几帧，它们会
    * 把刚抢到的焦点冲掉；图片还在解码时按下的第一个方向键，落在的是「什么
    * 都还没画出来」的画面。等第一帧真的有图了再落焦点，按下去就是立刻换一张。
    *
@@ -216,11 +291,6 @@ export class Viewer {
   async focusWhenReady(timeout = 4000) {
     await imageReady(this.currentSlot, timeout);
     this.focusView();
-  }
-
-  /** 关闭后是否退出应用（「打开方式」进来的窗口，关掉就该彻底消失） */
-  setExitOnClose(enabled) {
-    this.exitOnClose = Boolean(enabled);
   }
 
   /** 首尾是否循环。默认 false：到头就禁用按钮并给一次回弹提示。 */
@@ -266,6 +336,48 @@ export class Viewer {
     return this.stage.clientWidth || window.innerWidth;
   }
 
+  /**
+   * 把**视口坐标**里的矩形折成 **stage 坐标**。
+   *
+   * 跨窗口送过来的来源矩形是视口坐标（主窗口那边量的是
+   * `getBoundingClientRect()`），而 `view()` 给的是 stage 自己的尺寸、原点算
+   * (0,0)。stage 并不是整个视口 —— CSS 里它给顶栏让出了 `--chrome-top`、给底
+   * 部胶片条让出了 `--strip-h`。两套坐标混着用，起点就会整整偏移一个顶栏的
+   * 高度：明明点的是屏幕中间那一格，画面却从偏上的地方长出来。
+   *
+   * 只在开场/收场各量一次，不在手势的热路径上 —— `getBoundingClientRect()`
+   * 会强制一次布局，不能放进 pointermove。
+   */
+  localRect(rect) {
+    if (!rect) return null;
+    const host = this.stage.getBoundingClientRect();
+    return {
+      left: rect.left - host.left,
+      top: rect.top - host.top,
+      width: rect.width,
+      height: rect.height
+    };
+  }
+
+  /**
+   * 转场的**裁切框**：把画面裁到来源矩形那么大。
+   *
+   * 起点用 cover 取缩放（见 `mapBoxToRect`），画面因此会溢出那一格一点 ——
+   * 裁掉溢出量，开头那一帧才是缩略图那一格逐像素相同的画面，尺寸也对得齐。
+   *
+   * @param {?{left,top,width,height}} local stage 坐标里的矩形
+   * @returns {?string} `clip-path` 的 `inset()` 值
+   */
+  clipFor(local) {
+    if (!local || !(local.width > 0) || !(local.height > 0)) return null;
+    const view = this.view();
+    const l = clamp(local.left, 0, view.w);
+    const t = clamp(local.top, 0, view.h);
+    const r = clamp(view.w - (local.left + local.width), 0, view.w);
+    const b = clamp(view.h - (local.top + local.height), 0, view.h);
+    return `inset(${t}px ${r}px ${b}px ${l}px)`;
+  }
+
   /* ------------------------------------------------------------------ *
    * 打开 / 关闭
    * ------------------------------------------------------------------ */
@@ -274,23 +386,101 @@ export class Viewer {
    * 打开画廊。
    *
    * @param {number} index
-   * @param {?HTMLElement} [originEl] 从网格进来时的那张缩略图（FLIP 起点）
    * @param {object} [options]
    * @param {?{left,top,width,height}} [options.fromRect]
-   *        视口坐标系里的起点矩形（「打开方式」启动用）
-   * @param {number} [options.centerScale] 没有起点矩形时的起始倍率（中心放大）
-   * @param {boolean} [options.fadeIn] 是否叠加透明度渐变
+   *        视口坐标系里的起点矩形（那一格缩略图的位置）
+   * @param {number} [options.centerScale] 什么来源都没有时的起始倍率（中心放大）
+   *
+   * 不建议直接调用 —— 请用 {@link Viewer#openFullscreen}：它是全屏预览的
+   * 唯一入口，负责把「从哪来」折算成这里的一套几何参数。留在这个方法上的
+   * options 越自由，各条入口就越容易长得不一样（历史上正是这么分岔的）。
    */
-  open(index, originEl = null, options = {}) {
-    if (this.isOpen || this.closing || !this.items.length) return;
+  /**
+   * 开场前的「幕布」：只铺一层背景，不放画面。
+   *
+   * 切全屏是一段平台转场（macOS 上最明显，进出各约 0.3~0.5s），这段等待躲不
+   * 掉。不挂幕布的话，用户点下去到画面长出来之间有几百毫秒的「什么都没发
+   * 生」，很容易以为点漏了。挂上幕布，点击的反馈是即时的。
+   *
+   * 之后 `open()` 会从这层幕布**接着**淡入背景，不会先把背景归零再淡一次
+   * （那会闪一下），见 `open()` 里对 `is-priming` 的处理。
+   */
+  prime() {
+    if (this.isOpen || this.closing) return;
+    this.root.hidden = false;
+    this.root.classList.add('is-priming');
+    this.root.classList.remove('is-idle');
+    this.setBackdrop(1);
+
+    // 保险丝：幕布只负责「点到有反应」这一瞬间，不负责等下去。挂上之后如果
+    // 迟迟没有 `open()` 接手（形态切不过去、IPC 挂住、预览正忙被拒），它自己
+    // 撤掉 —— 一层不透明的全屏遮罩留在屏幕上，和程序死了没有区别。
+    clearTimeout(this._primeFuse);
+    this._primeFuse = setTimeout(() => this.cancelPrime(), PRIME_FUSE_MS);
+  }
+
+  /**
+   * 取消一次**还没落地**的打开。
+   *
+   * 与 {@link close} 的区别：那一刻画面根本还没画出来，没有退场动画可言，
+   * 直接收摊让预览窗口让位。用户的这次打开因此像没发生过一样。
+   */
+  abort() {
+    if (this.isOpen || this.closing) return;
+    clearTimeout(this._primeFuse);
+    this._primeFuse = 0;
+    this.root.classList.remove('is-priming');
+    this.setBackdrop(0);
+    this.root.hidden = true;
+    // 与「关闭完成」同一条出路：预览窗口让位，焦点交还主窗口
+    this.onClosed?.();
+  }
+
+  /** 撤掉幕布（开场没走通时兜底，别把画面永久盖住） */
+  cancelPrime() {
+    clearTimeout(this._primeFuse);
+    this._primeFuse = 0;
+    if (this.isOpen) return;
+    this.root.classList.remove('is-priming');
+    this.setBackdrop(0);
+    this.root.hidden = true;
+  }
+
+  /** 现在能不能开一次预览（会话到手时先看一眼，别把一次开到一半的重来）。 */
+  get canOpen() {
+    return !this.isOpen && !this.closing && this.items.length > 0;
+  }
+
+  open(index, options = {}) {
+    // 没有内容时：幕布可能是宿主刚挂上的，完整撤掉（此时没有会话在跑）。
+    if (!this.items.length) {
+      this.cancelPrime();
+      return;
+    }
+    // 预览正开着 / 上一次关闭还没收尾：动不得。这里只摘掉幕布类，
+    // `hidden` 与背景交给那一次 `close()` 收尾 —— 提前归零会把关闭动画
+    // 的底色抽掉。
+    if (this.isOpen || this.closing) {
+      clearTimeout(this._primeFuse);
+      this._primeFuse = 0;
+      this.root.classList.remove('is-priming');
+      return;
+    }
 
     this.index = clamp(index, 0, this.items.length - 1);
-    this.originEl = originEl?.classList ? originEl : null;
+    // 记下起点，关闭时原路缩回去（预览窗口里没有网格，无法现问）
+    this.originRect = options.fromRect ?? null;
+
+    // 幕布已经在的话，背景就是不透明的：直接接着用，别归零再淡一次（会闪）
+    const priming = this.root.classList.contains('is-priming');
+    clearTimeout(this._primeFuse);
+    this._primeFuse = 0;
+    this.root.classList.remove('is-priming');
 
     // 必须先显示再填充：`hidden` 时 stage 的尺寸是 0，fitBox 会算出 0×0
     this.root.hidden = false;
     this.root.classList.remove('is-idle');
-    this.setBackdrop(0);
+    if (!priming) this.setBackdrop(0);
 
     this.slotIndex = 1;
     this.fill(this.slots[0], this.index - 1);
@@ -305,26 +495,48 @@ export class Viewer {
     this.attachGestures();
     this.updateInfo();
 
-    const from = this.zoomStart(offsetBox(originEl), options);
+    // 「减少动态效果」时不做 FLIP：缩放位移正是这类设置要消掉的东西
+    const from = motionOK() ? this.zoomStart(options) : null;
     const slide = this.slots[1];
 
     // 展开动画期间不接受手势：中途拖一下会同时跑 FLIP 和滑动，画面会打结
     if (this.g) this.g.enabled = false;
 
     if (from) {
-      const keyframes = {
-        transform: [from, 'translate3d(0px, 0px, 0) scale(1)']
-      };
-      // 「从某一格长出来」要配透明度渐变才像透视，纯位移会显得很硬。
-      // 网格那条路径原本没有渐变：那里是同一张图的缩略图到原图，中间不该透。
-      if (options.fadeIn) keyframes.opacity = [0, 1];
-
-      const anim = slide.animate(keyframes, {
+      // 位移与透明度拆成两条动画：一条动画只能给一条缓动曲线，而这两种运动
+      // 想要的节奏并不一样（见 `TWEEN_FADE_EASE` 的注释）。两者等长、
+      // `fill: 'backwards'`，在同一帧上叠加，观感仍是一次展开。
+      //
+      // `backwards` 而不是 `none`：动画对象创建出来之后还要等一帧才真正开跑，
+      // 那一帧里元素显示的是它自己的基础样式 —— 也就是**全尺寸、不透明**。
+      // 于是开场会先闪一帧「画面已经到位」，然后才缩回去重新长大。填满「开跑
+      // 之前」那一段就没有这一帧。
+      const anim = slide.animate(
+        { transform: [from, 'translate3d(0px, 0px, 0) scale(1)'] },
+        { duration: OPEN_MS, easing: OPEN_EASE, fill: 'backwards' }
+      );
+      // 「从某一格长出来」必须配透明度渐变才像透视，纯位移会显得很硬。
+      //
+      // 这里写死而不再留给调用方开关：以前「打开方式」传 `fadeIn: true`、
+      // 网格点击不传，于是同一个全屏预览在两条入口上是两种观感。现在三条
+      // 入口都经过 `openFullscreen()`，渐变是这条路的唯一形态。
+      slide.animate({ opacity: [0, 1] }, {
         duration: OPEN_MS,
-        easing: EASE,
-        fill: 'none'
+        easing: TWEEN_FADE_EASE,
+        fill: 'backwards'
       });
-      this.fadeBackdrop(1, 280);
+      // 裁切框：起点按 cover 取缩放，画面会溢出那一格一点（见
+      // `mapBoxToRect`）。裁掉溢出量，第一帧才是缩略图那一格逐像素相同的
+      // 画面 —— 位置和尺寸都对得上，而不是「大致从那边来」。
+      const clip = this.clipFor(this.localRect(options.fromRect));
+      if (clip) {
+        this.stage.animate(
+          { clipPath: [clip, 'inset(0px 0px 0px 0px)'] },
+          { duration: OPEN_MS, easing: OPEN_EASE, fill: 'backwards' }
+        );
+      }
+      this.fadeBackdrop(1, BACKDROP_OPEN_MS);
+      this.boost(slide, anim);
       // 转场跑完再拉原图，避免大图解码抢走转场的帧
       anim.finished
         .then(() => {
@@ -334,34 +546,53 @@ export class Viewer {
         })
         .catch(() => {});
     } else {
-      slide.animate({ opacity: [0, 1] }, { duration: 200, easing: 'ease-out', fill: 'none' });
-      this.fadeBackdrop(1, 200);
+      const ms = motionMs(OPEN_MS);
+      slide.animate({ opacity: [0, 1] }, { duration: ms, easing: TWEEN_FADE_EASE, fill: 'none' });
+      this.fadeBackdrop(1, ms);
       setTimeout(() => {
         if (this.g) this.g.enabled = true;
-      }, 200);
+      }, ms);
       this.startFullLoad();
       this.preloadNeighbors();
     }
 
-    if (this.originEl) this.originEl.classList.add('is-origin-hidden');
     this.isOpen = true;
     this.bumpChrome();
   }
 
   /**
-   * 开场动画的起始 transform，取不到就返回 null（走普通淡入）。
+   * 转场期间给元素开合成层提示，跑完立刻撤掉。
    *
-   * 优先级：缩略图元素（网格那条路） → 显式矩形（「打开方式」） → 中心缩放
-   * （拿不到来源信息时的兜底）。时长与缓动沿用 `OPEN_MS` / `EASE`，与关闭、
-   * 切换保持同一套手感。
+   * 只在动画那几百毫秒里挂 `will-change`：常驻的话，浏览器会为整张预览图
+   * 一直留着一张合成层，内存与低速设备上的合成开销都白白吃进去。
+   */
+  boost(el, anim) {
+    if (!el) return;
+    el.style.willChange = 'transform, opacity';
+    anim?.finished?.then(() => {
+      el.style.willChange = '';
+    }).catch(() => {
+      el.style.willChange = '';
+    });
+  }
+
+  /**
+   * 开场/收场那次变形的起始（或终止）transform，取不到就返回 null（走普通淡入）。
    *
-   * @param {?{width:number,height:number}} thumbRect
+   * 优先级：来源矩形（那一格缩略图，由主窗口经屏幕坐标折算过来） → 中心缩放
+   * （拿不到来源信息时的兜底）。时长与缓动沿用 `OPEN_MS` / `OPEN_EASE`。
+   *
+   * 来源矩形进来时是**视口坐标**，这里先折成 stage 坐标再用 —— 见
+   * {@link localRect}：少这一步，起点会整体偏一个顶栏的高度。
+   *
    * @param {{fromRect?: ?object, centerScale?: number}} [options]
    */
-  zoomStart(thumbRect, { fromRect = null, centerScale = 0 } = {}) {
+  zoomStart(options = {}) {
+    const { fromRect = null, centerScale = 0 } = options ?? {};
     const usable = (rect) =>
       rect && Number.isFinite(rect.width) && rect.width > 0 && rect.height > 0;
-    const rect = usable(thumbRect) ? thumbRect : usable(fromRect) ? fromRect : null;
+    const local = this.localRect(fromRect);
+    const rect = usable(local) ? local : null;
 
     if (rect) {
       const { scale, tx, ty } = mapBoxToRect(this.box, rect, this.view());
@@ -374,79 +605,224 @@ export class Viewer {
   }
 
   /**
-   * 「打开方式」启动专用开场：从那一格（或屏幕中心兜底）放大到全屏。
+   * 全屏预览的**唯一**入口。
    *
-   * 不返回 Promise、不等任何图片：几何来自 `items` 里的宽高元数据，
-   * 所以第一帧就能动起来，底图到达时自然补上。
+   * 三条进入预览的路 —— 图片墙点击、图片墙里回车、「打开方式」启动 —— 在
+   * 主窗口那边都汇到 `api.openViewer`（差别只是 `immersive` 与来源矩形），
+   * 到这边又都汇到 {@link openLaunch}，所以开场几何、透明度渐变、背景淡入、
+   * 时长缓动、之后的缩放拖拽切换关闭整套交互，在代码上就是同一份实现。
+   *
+   * 以前是每条路各自给 `open()` 配一套 options：忘了传 `fadeIn`、忘了给中心
+   * 兜底倍率，两条入口的观感就悄悄不一样了，而且这类差异没有任何测试会报错。
+   * 收敛成一个入口之后，「有来源矩形 / 没有来源矩形」只是来源的两种情况，
+   * 不再是两种呈现。
+   *
+   * 不返回 Promise、不等任何图片：几何来自 `items` 里的宽高元数据，第一帧
+   * 就能动起来，底图到达时自然补上。
+   *
+   * @param {number} index
+   * @param {?{rect?: ?object}} [source] 开场动画的来源矩形（视口坐标系）。
+   *   没有（跨窗口那趟没送到、或本来就没有）就从屏幕中心按
+   *   {@link CENTER_ZOOM_SCALE} 放大 —— 兜底而非失败，用户看到的仍是同一次
+   *   放大，只是少了「从哪儿来」这条信息。
+   */
+  openFullscreen(index, source = null) {
+    this.open(index, {
+      fromRect: source?.rect ?? null,
+      centerScale: CENTER_ZOOM_SCALE
+    });
+  }
+
+  /**
+   * 预览窗口的专用入口。
+   *
+   * 来源矩形是**屏幕坐标经折算**得来的：主窗口把那一格的位置折到桌面坐标系
+   * 再送过来，这里再按预览窗口自己的原点折回视口 —— 预览是独立窗口，全屏落
+   * 在哪块屏取决于主窗口在哪块屏。
    *
    * @param {number} index
    * @param {?{left,top,width,height}} rect 视口坐标系里的来源矩形
    */
   openLaunch(index, rect) {
-    this.open(index, null, {
-      fromRect: rect,
-      centerScale: CENTER_ZOOM_SCALE,
-      fadeIn: true
-    });
+    this.openFullscreen(index, { rect });
   }
 
+  /**
+   * 关闭预览。
+   *
+   * 分两段，顺序是这次动效的关键：
+   *
+   *   1. **画面退场** —— 图片缩回开场时那一格的方向并淡出。背景**不动**，
+   *      仍是不透明的；
+   *   2. **幕布退去** —— 根容器连它那层不透明背景一起淡掉。之后后端把预览
+   *      窗口**整个销毁**（见 `finishClose` 的注释），用户看到的直接是图片墙。
+   *
+   * 以前这里夹着第三段「幕后换场」：趁幕布还盖着把窗口形态还回去、让网格
+   * 重排。分家之后那一段整个消失了 —— 预览是独立窗口，图片墙那条窗口在这
+   * 次关闭里一个像素都没被动过，也就没有什么需要藏在幕布后面。
+   */
   async close({ fromDismiss = false } = {}) {
     if (!this.isOpen || this.closing) return;
     this.closing = true;
     // 关闭动画期间冻结手势，否则中途再拖一下会打断 FLIP
     if (this.g) this.g.enabled = false;
 
-    const slide = this.currentSlot;
-    if (!slide) {
+    // 收尾放进 `finally`：从这一行到 `finishClose()` 之间横着动画回执、幕后
+    // 换场的 IPC、幕布淡出三段异步，任何一段抛错或永不兑现，都不能把那层
+    // `position:fixed; inset:0` 的预览留在屏幕上 —— 那正是「退出后界面卡死」
+    // 的直接形态。`finishClose()` 本身是幂等的。
+    try {
+      await this.playClose({ fromDismiss });
+    } finally {
       this.finishClose();
-      return;
     }
+  }
+
+  /** 关闭的动画部分（不含收尾）；`close()` 保证它一定跟得上 `finishClose()`。 */
+  async playClose({ fromDismiss = false } = {}) {
+    const slide = this.currentSlot;
+    if (!slide) return;
 
     // 放大状态下先收回适配尺寸，这样 FLIP 的起点矩形才是确定的
     if (!fromDismiss && this.g?.isZoomed) {
-      await this.g.reset(true);
+      await withTimeout(this.g.reset(true), 400);
     }
 
-    // 此刻背景仍不透明，网格的滚动不会被看见
-    this.grid.ensureVisible(this.index);
-    const target = this.grid.getRect(this.index);
+    // 落点就是开场时记下的那一格。预览窗口里没有网格 DOM，关不掉时才去问
+    // 「这一格现在在哪」—— 那种问法在跨窗口之后不再成立。
+    //
+    // 与开场一样要先折成 stage 坐标（`localRect`），并配裁切框：收场是开场的
+    // 逆过程，两边用同一套几何才是对称的来回 —— 否则「长出来」和「缩回去」
+    // 落点差几十像素，看着就是一次抖动。
+    const target = this.localRect(this.originRect);
 
     const start = slide.style.transform || 'translate3d(0px, 0px, 0) scale(1)';
     const startOpacity = this.backdropOpacity;
 
+    // 「减少动态效果」时只淡出，不做缩回位移
+    const useFlip = motionOK() && target && target.width > 0;
     let end = 'translate3d(0px, 0px, 0) scale(0.94)';
-    if (target && target.width > 0) {
+    if (useFlip) {
       const { scale, tx, ty } = mapBoxToRect(this.box, target, this.view());
       end = `translate3d(${tx}px, ${ty}px, 0) scale(${scale})`;
     }
 
-    slide.animate({ transform: [start, end] }, { duration: CLOSE_MS, easing: EASE, fill: 'none' });
-    // 收尾淡出：掩盖「全屏原图 → 网格缩略图」的分辨率落差
-    slide.animate({ opacity: [1, 1, 0] }, { duration: CLOSE_MS, easing: 'linear', fill: 'none' });
+    const ms = motionMs(CLOSE_MS);
+    // 缓动与开场同一条（`OPEN_EASE`）：来回是同一次运动，不能一边弹开一边收。
+    const anim = slide.animate({ transform: [start, end] }, {
+      duration: ms,
+      easing: OPEN_EASE,
+      fill: 'none'
+    });
+    const clip = useFlip ? this.clipFor(target) : null;
+    if (clip) {
+      this.stage.animate(
+        { clipPath: ['inset(0px 0px 0px 0px)', clip] },
+        { duration: ms, easing: OPEN_EASE, fill: 'none' }
+      );
+    }
+    // 收尾淡出：掩盖「全屏原图 → 网格缩略图」的分辨率落差。
+    // 前 55% 保持不透明（画面在飞行中始终是实的），后段再缓出淡掉 —— 用
+    // offset 加分段缓动，比整段 linear 少一点「到点突然开始消失」的生硬。
+    slide.animate({ opacity: [1, 1, 0], offset: [0, 0.55, 1] }, {
+      duration: ms,
+      easing: ['linear', 'ease-out'],
+      fill: 'none'
+    });
+    this.boost(slide, anim);
 
-    const fade = this.backdrop.animate(
-      { opacity: [startOpacity, 0] },
-      { duration: CLOSE_MS, easing: 'ease-out', fill: 'none' }
+    // 背景这一段的走向分两种：
+    //   * 普通关闭 —— 原地不动。幕布要留到**根容器**那一段才退，现在就把它
+    //     淡掉，等于让画面在半透明状态下被抽走；
+    //   * 下拉关闭 —— 背景早被手势拖淡了，这时补回不透明反而是闪一下，照
+    //     原样淡到 0 收尾。
+    const backdropEnd = fromDismiss ? 0 : startOpacity;
+    const exit = this.backdrop.animate(
+      { opacity: [startOpacity, backdropEnd] },
+      { duration: ms, easing: TWEEN_FADE_EASE, fill: 'none' }
     );
-    this.backdropOpacity = 0;
+    this.backdropOpacity = backdropEnd;
 
     this.root.classList.remove('is-idle');
-    if (this.originEl) this.originEl.classList.remove('is-origin-hidden');
 
-    await fade.finished.catch(() => {});
-    this.finishClose();
+    await withTimeout(
+      Promise.all([anim.finished, exit.finished]).catch(() => {}),
+      ms + ANIM_SLACK_MS
+    );
+    // 动画是 `fill: 'none'`，一结束透明度就会弹回元素本身的 1 —— 下面还要
+    // 整屏隐去，画面绝不能这时候又冒出来。
+    slide.style.opacity = '0';
+
+    // 幕布退去。根容器上那层不透明背景跟着一起淡掉之后，窗口隐去只是一下
+    // 消失（而不是「啪」地把画面抽走）。
+    //
+    // 以前这两步之间还夹着「后台换场」—— 趁幕布还盖着把窗口形态还回来、让
+    // 网格重排。分家之后那件事整个没了：预览是独立窗口，收摊时它被**整个销毁**，
+    // 图片墙那条窗口的布局从头到尾没被顶过一下。
+    //
+    // 淡的是**根容器**而不是 `.viewer-backdrop`：根容器自己就带着一层不透明
+    // 背景（`--viewer-bg` 是实心色），只淡背景层的话底下还是黑的 —— 那一层
+    // 从来没真正"退去"过，以前是靠 `root.hidden = true` 硬切掉的。
+    await withTimeout(
+      this.root
+        .animate({ opacity: [1, 0] }, {
+          duration: motionMs(CURTAIN_MS),
+          easing: TWEEN_FADE_EASE,
+          fill: 'none'
+        })
+        .finished.catch(() => {}),
+      CURTAIN_MS + ANIM_SLACK_MS
+    );
+    this.root.style.opacity = '';
   }
 
   finishClose() {
+    // 幂等：`close()` 把收尾放在 `finally` 里，任何一条路径都要保证它跑，
+    // 也都要保证它不会跑第二次（否则 `onClosed` 会把焦点抢两遍）。
+    if (!this.isOpen && !this.closing) return;
+
+    clearTimeout(this._primeFuse);
+    this._primeFuse = 0;
+    this.root.style.opacity = '';
+    // 「空闲隐藏」这个类是预览**开着**时才有意义的显示状态，收摊时必须一并
+    // 撤掉：留着它，下一次开场的第一帧会因为 `.viewer.is-idle` 而把控件的
+    // 透明度定在 0，控件要到第一次 `bumpChrome()` 才冒出来。
+    this.root.classList.remove('is-idle');
     this.g?.detach();
     this.g = null;
     this.resetSlots();
+    // 撤幕布走的是根容器的透明度，背景层这一路下来始终停在 1。归零，下次
+    // 开场才不会从「背景已经满了」的状态开始（那样就没有淡入可言）。
+    this.setBackdrop(0);
     this.root.hidden = true;
+    this.root.classList.remove('is-priming');
     this.isOpen = false;
     this.closing = false;
     clearTimeout(this._idle);
-    // 沉浸式预览：窗口是为这一张而开的，关掉就等于「回到文件管理器」
-    if (this.exitOnClose) this.onExit();
+    // 唯一的收尾出口：要不要连带退出应用是**会话语义**，由调用方在这个回调
+    // 里决定 —— Viewer 只保证画面收干净、这一次通知一定送到。
+    //
+    // 早先这里还并行着一条 `onExit`（`exitOnClose` 为真时再调一次），于是
+    // 「打开方式」那条会话关一次会退出两次：一次来自 `onClosed` 里的分支，
+    // 一次来自这里。两条出口并存是这类重复动作的温床，现在只留一条。
+    this.onClosed?.();
+  }
+
+  /**
+   * 彻底卸载预览层：拆掉观察器与全局监听器。
+   *
+   * 平时用不到（预览窗口退出时整条被销毁，这个 webview 随它一起消失），但
+   * 「退出预览」这件事必须有一个明确的、能把所有全局副作用收回去的出口 ——
+   * 否则「预览关了之后还有谁在监听键盘 / 还在观察尺寸」只能靠读代码回答。
+   */
+  destroy() {
+    this.finishClose();
+    this._ro?.disconnect();
+    if (this._resizeRaf) cancelAnimationFrame(this._resizeRaf);
+    this._resizeRaf = 0;
+    window.removeEventListener('keydown', this._onKey, true);
+    window.removeEventListener('resize', this._onResize);
+    this.strip?.destroy?.();
   }
 
   /* ------------------------------------------------------------------ *
@@ -497,9 +873,6 @@ export class Viewer {
     this.index = target;
     this.box = this.slots[targetSlot].__box ?? this.box;
 
-    // 先把目标缩略图滚进视口，关闭动画才有落点
-    this.grid.ensureVisible(target);
-
     // 立刻起拉原图：动画只动 transform，跑在合成器线程上，解码抢不走它的帧
     this.startFullLoad();
 
@@ -507,7 +880,6 @@ export class Viewer {
     this.strip.focus(target);
     this.attachGestures();
     if (this.g) this.g.enabled = false;
-    this.syncOrigin(target);
     this.bumpChrome();
 
     // 收尾动画只补完剩下的那段距离 —— 跟手已经推掉大半时，固定 300ms 会让
@@ -544,7 +916,6 @@ export class Viewer {
     if (this.g?.isZoomed) this.g.reset(false);
     if (this.g) this.g.swipeX = 0;
 
-    this.grid.ensureVisible(target);
     this.index = target;
     this.slotIndex = 1;
     this.fill(this.slots[1], target);
@@ -552,7 +923,7 @@ export class Viewer {
 
     const slide = this.slots[1];
     slide.style.opacity = '0';
-    slide.animate({ opacity: [0, 1] }, { duration: JUMP_MS, easing: 'ease-out', fill: 'none' });
+    slide.animate({ opacity: [0, 1] }, { duration: JUMP_MS, easing: TWEEN_FADE_EASE, fill: 'none' });
 
     this.trackOffset = -this.slotWidth();
     this.track.style.transform = `translate3d(${this.trackOffset}px, 0, 0)`;
@@ -565,7 +936,6 @@ export class Viewer {
     this.updateInfo();
     this.strip.focus(target, { immediate: true });
     this.attachGestures();
-    this.syncOrigin(target);
     this.bumpChrome();
 
     await new Promise((resolve) => setTimeout(resolve, JUMP_MS));
@@ -917,23 +1287,6 @@ export class Viewer {
     return Math.abs(x - cx) <= halfW && Math.abs(y - cy) <= halfH;
   }
 
-  /**
-   * 让「原始缩略图」跟随当前索引。切换图片后，关闭动画的落点、以及缩略图
-   * 的隐藏态，都得挪到新图对应的格子上 —— 否则关回去时会落到旧图位置，
-   * 而且旧缩略图会一直隐形。
-   */
-  syncOrigin(index) {
-    if (this.originEl) {
-      this.originEl.classList.remove('is-origin-hidden');
-      this.originEl = null;
-    }
-    const cell = this.grid.cellFor?.(index) ?? null;
-    if (cell) {
-      cell.classList.add('is-origin-hidden');
-      this.originEl = cell;
-    }
-  }
-
   startFullLoad() {
     const item = this.currentItem;
     const slot = this.currentSlot;
@@ -953,6 +1306,33 @@ export class Viewer {
     const item = this.items[this.index + direction];
     if (!item) return;
     preload(fullUrl(item.id, maxEdgeFor(item)), 'high');
+  }
+
+  /**
+   * 把某一张的**底图**取回来并解码好，返回一个可以等的 Promise。
+   *
+   * 跨窗口开场时这一步是「闪不闪」的开关：`open()` 不等图片 —— 几何来自宽高
+   * 元数据，第一帧就能动 —— 于是 FLIP 起来的是个**空框**，等缩略图解码完突然
+   * 填上，就是一次实打实的跳变。而预览是另一个 webview，它的图片缓存是空的，
+   * 这张图必然要现取。
+   *
+   * 所以由宿主在「切全屏」那段躲不掉的等待里**并行**把它取回来，等开场几何
+   * 算完、图片通常也已经就位了。等待必须有限（见调用处）：图片取不到也不能
+   * 拖着不开场 —— 那时退化成空框长大，总比永远不响应用户好。
+   *
+   * @param {number} index
+   * @returns {Promise<void>} 图片已解码（或取不到，也一样兑现）
+   */
+  preload(index) {
+    const item = this.items[clamp(index, 0, this.items.length - 1)];
+    if (!item) return Promise.resolve();
+    const img = new Image();
+    img.decoding = 'async';
+    img.src = thumbUrl(item.id);
+    // `decode()` 兑现 = 这一张已经能画上去了（而不只是「字节到了」）；
+    // 平台不支持或解码失败都当作「没预热成」，调用方照常开场。
+    if (typeof img.decode !== 'function') return Promise.resolve();
+    return img.decode().catch(() => {});
   }
 
   /** 预取前后各一张的原图，让方向键切换几乎无等待 */
@@ -998,7 +1378,7 @@ export class Viewer {
     if (duration > 0 && from !== this.backdropOpacity) {
       this.backdrop.animate({ opacity: [from, this.backdropOpacity] }, {
         duration,
-        easing: 'ease-out',
+        easing: TWEEN_FADE_EASE,
         fill: 'none'
       });
     }
@@ -1106,7 +1486,21 @@ export class Viewer {
   }
 
   onKeyDown(event) {
-    if (!this.isOpen) return;
+    // 预览还没真正打开：切全屏那一串 IPC 还没走完，画面一格都没画。这时 Esc
+    // 的语义是「取消这次打开」，而它必须是**直接收摊**，不是 `close()` ——
+    // 后者要求 `isOpen` 为真，在这里会被挡掉。
+    //
+    // 少了这一条，用户在等待的那几百毫秒里按 Esc 是**毫无反应**的：预览没开
+    // 所以关闭分支不认，幕布又还盖着，然后预览会在形态切换落定后自己打开
+    // —— 看着就是「按了没用、界面还卡着」。那段等待在慢机器或转场被打断时
+    // 能拖到好几秒，正是最容易让人以为程序死了的窗口。
+    if (!this.isOpen && !this.closing) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        this.abort();
+      }
+      return;
+    }
     // 任何按键都算「有操作」：按下就唤醒整套控件（标题栏 + 按钮 + 画廊），
     // 不能只有方向键才唤醒 —— 用户按了别的键却什么都没出现，就是不同步。
     this.bumpChrome();
@@ -1205,15 +1599,4 @@ function imageReady(slide, timeout = 4000) {
       img.addEventListener('error', finish);
     }
   });
-}
-
-/**
- * 起点元素的矩形。
- *
- * 抽出来是因为 `open()` 的起点既可以是网格里的缩略图元素，也可以是「打开
- * 方式」给的一个纯对象；两者混在一起判断，最后一定会漏掉 `getBoundingClientRect`
- * 不存在的情况。
- */
-function offsetBox(el) {
-  return el?.getBoundingClientRect?.() ?? null;
 }
