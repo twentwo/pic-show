@@ -836,6 +836,46 @@ fn dir_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| String::from("PicShow"))
 }
 
+/**
+ * 「打开方式」会话退出时，把桌面（Space）与焦点交还给触发打开的那个应用。
+ *
+ * 改动刻意收得很窄：只在 macOS、且这次会话确实是「被外部要求看图」
+ * （`was_launched()`）时才动作。常规启动、从图片墙点开的预览走 `close_viewer`
+ * → `reveal_main_window()`，根本不会调到这里；单桌面下交还前台等价于把焦点
+ * 还给打开它的那个应用，与系统默认一致。
+ *
+ * 交还是**一次性的**（`macos::restore_launch_source` 里有闸门），所以
+ * `exit_app` 与 `RunEvent::ExitRequested` 都调也不会切两次桌面。
+ *
+ * @returns 是否发出了激活请求 —— 调用方据此给 AppKit 留一小段落地时间再退出
+ */
+pub fn hand_back_launch_source(app: &AppHandle) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let state = app.state::<AppState>();
+        // 两个条件缺一不可：既要是「被外部要求看图」的会话，又必须确实是
+        // Finder 的「打开方式」事件（命令行 argv、拖放、图片墙点开都不算）。
+        if !state.was_launched() || !state.space_restore_armed() {
+            return false;
+        }
+        return crate::macos::restore_launch_source();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        false
+    }
+}
+
+/**
+ * 交还前台后给 AppKit 的落地时间（毫秒）。
+ *
+ * `activateWithOptions:` 是一次异步请求：进程立刻退出，可能把它丢在半路。
+ * 这段等待只发生在「打开方式」的沉浸式退出上，且不改变用户看到的退出结果
+ * —— 进程仍在几百毫秒内结束；常规退出（没有交还动作）一帧都不多等。
+ */
+const LAUNCH_SOURCE_EXIT_GRACE_MS: u64 = 140;
+
 /// 退出应用。沉浸式预览是「为看这张图而存在」的，Esc 之后就该彻底退回去，
 /// 而不是留下一个空的浏览器界面。
 #[tauri::command]
@@ -844,6 +884,13 @@ pub fn exit_app(app: AppHandle) {
     // 迟早也会回收那个全屏桌面，但先销毁窗口能让这一瞬不留下常规尺寸的空白
     // 窗口帧（见 `release_viewer_now`）。
     release_viewer_now(&app);
+
+    // 「打开方式」来的那次：把桌面与焦点交还给触发打开的那个应用（访达），
+    // 否则 macOS 会把用户丢回第一个 Space。常规启动 / 图片墙路径这里返回
+    // false，一行多余动作都不会有。
+    if hand_back_launch_source(&app) {
+        std::thread::sleep(Duration::from_millis(LAUNCH_SOURCE_EXIT_GRACE_MS));
+    }
     app.exit(0);
 }
 

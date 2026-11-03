@@ -49,6 +49,18 @@ pub struct AppState {
     ready: AtomicBool,
     /// 本次启动是不是「被系统要求打开某张图」唤起的。
     launched: AtomicBool,
+    /**
+     * 退出时要不要做「桌面（Space）交还」。
+     *
+     * 只有 macOS Finder 的「打开方式」Apple Event（`RunEvent::Opened`）会把它
+     * 置起来。命令行 `picshow <文件>` 同样会 `mark_launched()`，但那是另一类
+     * 入口 —— 不该因为修 Space 问题就顺手改掉它的退出行为；拖放、文件对话
+     * 框、图片墙点开更是连 `launched` 都不会置。
+     *
+     * 于是 `hand_back_launch_source` 要 `launched && armed` 两个条件同时成立才
+     * 动作，改动面被钉死在「非首个 Space 的访达打开方式」这一条路径上。
+     */
+    space_restore_armed: AtomicBool,
     /// 目标文件名（用于窗口标题）。
     launch_title: RwLock<Option<String>>,
     /**
@@ -115,6 +127,7 @@ impl Default for AppState {
             launch: RwLock::new(None),
             ready: AtomicBool::new(false),
             launched: AtomicBool::new(false),
+            space_restore_armed: AtomicBool::new(false),
             launch_title: RwLock::new(None),
             viewer_request: RwLock::new(None),
             viewer_listening: AtomicBool::new(false),
@@ -215,6 +228,15 @@ impl AppState {
 
     pub fn was_launched(&self) -> bool {
         self.launched.load(Ordering::Relaxed)
+    }
+
+    /// 只有 macOS Finder 的「打开方式」事件才会调这一下。
+    pub fn arm_space_restore(&self) {
+        self.space_restore_armed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn space_restore_armed(&self) -> bool {
+        self.space_restore_armed.load(Ordering::Relaxed)
     }
 
     pub fn launch_title(&self) -> Option<String> {

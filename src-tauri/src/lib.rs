@@ -26,6 +26,16 @@ use tauri::{Listener, Manager};
 use state::AppState;
 
 pub fn run() {
+    // 「打开方式」的桌面恢复从这里开始：记下**此刻**的前台应用（那就是触发
+    // 打开操作的访达）。必须早于 `build()` —— 那时 `NSApplication` 还没初始
+    // 化、应用还没被激活，读到的才不是自己。`tools/appkit_space_restore.swift`
+    // 把这条时序测成了事实；晚一步再捕获就只能记到 PicShow 自己。
+    //
+    // 这里只是「记录」，不改变任何窗口行为；真正的交还只发生在沉浸式会话
+    // 退出时（见 `commands::hand_back_launch_source`）。
+    #[cfg(target_os = "macos")]
+    crate::macos::capture_launch_source();
+
     // 启动意图在**第一行**就判定：命令行里带了图片路径，这次就是「被系统要求
     // 看图」，主界面从头到尾都不该出现。
     //
@@ -185,6 +195,17 @@ pub fn run() {
     // 走的正是这条路（冷启动那次也走，只是那时还没有前端在听，靠 pending 补）。
     app.run(|handle, event| {
         if let tauri::RunEvent::Opened { urls } = event {
+            // 应用**已经在运行**时又被「打开方式」唤起：这是新的一次打开，
+            // 趁 LaunchServices 还没把 PicShow 彻底激活，再记一次触发者（冷
+            // 启动那次走的是 `run()` 第一行）。读到自己时 `capture` 会保留
+            // 旧记录，不会把来源覆盖成 PicShow。
+            #[cfg(target_os = "macos")]
+            {
+                crate::macos::capture_launch_source();
+                // 只给 Finder 的「打开方式」启用「退出时把桌面交还回去」。
+                // 命令行 argv 那条通道不经过这里，退出行为原样不变。
+                handle.state::<AppState>().arm_space_restore();
+            }
             let paths: Vec<PathBuf> = urls
                 .iter()
                 .filter_map(|url| url.to_file_path().ok())
@@ -197,8 +218,12 @@ pub fn run() {
         // 退出路径的兜底：无论因为什么退出（主窗口关掉、Dock 菜单退出、系统
         // 关机），都先销毁预览窗口。进程一死 AppKit 也会回收那个全屏桌面，但
         // 先销毁窗口能让退出那一瞬不闪出常规尺寸的空白窗口帧。
+        //
+        // 沉浸式会话（打开方式）还要把桌面与焦点交还给触发打开的那个应用；
+        // 常规启动 / 图片墙路径 `hand_back_launch_source` 会自己判定并直接跳过。
         if let tauri::RunEvent::ExitRequested { .. } = event {
             commands::release_viewer_now(handle);
+            commands::hand_back_launch_source(handle);
         }
     });
 }

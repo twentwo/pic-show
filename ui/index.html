@@ -42,12 +42,35 @@
   </head>
   <body>
     <!-- ===================== 网格模式 ===================== -->
+    <!--
+      图片墙**唯一的顶部区域**。
+
+      「标题栏信息」（品牌 + 名称）与「工具栏操作」（打开图片 / 打开文件夹 /
+      主题）合并进同一个连续的顶栏元素（`header.topbar`）：只有这一条，页面里
+      没有第二条标题栏，也没有另起一行、另起一块的独立工具栏。`.topbar-sep`
+      只是这条区域内部的分组分隔线，不是新的一条栏。
+
+      系统标题栏是透明且隐藏标题文字的（FullSizeContentView），它只贡献左上
+      角三个交通灯；这条自绘栏从窗口最上边缘连续铺满 `--topbar-h`，用左侧
+      padding 给交通灯让位。于是「标题栏」与「工具栏」在视觉上是一整条，
+      不再分层、也不重复。
+
+      信息（品牌 / 名称 / 状态）与操作入口（三个按钮）一个不少地留在这里；
+      窗口变窄时由 `app.css` 统一收紧间距、让状态文字与分隔线让位，操作入口
+      始终完整可点。窗口尺寸怎么变，这条栏都只有一行、高度恒为 `--topbar-h`，
+      下面 `.grid` / `.empty` 的 `inset` 因此永远对得上。
+    -->
     <header class="topbar">
+      <!-- ① 标题栏信息：主层级，同时是可拖拽区 -->
       <div class="brand" data-tauri-drag-region>
         <span class="logo"></span>
         <span class="appname">PicShow</span>
       </div>
 
+      <!-- ② 分组分隔：同一条连续区域内「标题信息 → 工具栏操作」的一级层级 -->
+      <span class="topbar-sep" aria-hidden="true"></span>
+
+      <!-- ③ 工具栏操作入口：合并进顶栏，不再另设独立工具栏 -->
       <div class="topbar-actions">
         <button id="btn-open-files" class="btn" type="button">打开图片…</button>
         <button id="btn-open-folder" class="btn btn-primary" type="button">
@@ -73,7 +96,7 @@
       </div>
 
       <!--
-        可拖拽的空白区。
+        ④ 可拖拽的空白区（仍是这条栏的一部分）。
 
         注意：绝对不要把按钮放进 `data-tauri-drag-region` 元素内部。
         Tauri 会在该区域的 mousedown 上接管事件用于拖动窗口，
@@ -81,6 +104,7 @@
       -->
       <div class="topbar-drag" data-tauri-drag-region></div>
 
+      <!-- ⑤ 辅助信息层级：状态 / 缓存 -->
       <div class="topbar-status">
         <span id="status-text">未打开任何图片</span>
         <span id="cache-text" class="cache-text"></span>

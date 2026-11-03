@@ -37,11 +37,20 @@ walkdir = "2"
 # 锁
 parking_lot = "0.12"
 
-# macOS 专用：给无边框窗口补回原生全屏能力（详见 src/macos.rs）。
+# macOS 专用：给无边框窗口补回原生全屏能力，并在「打开方式」退出时把桌面与
+# 焦点交还给触发打开的那个应用（详见 src/macos.rs）。
 # 版本跟着 tao 内部用的那份走，属于同一个已编译依赖，不会带来额外构建成本。
+# NSWorkspace / NSRunningApplication / libc 三个 feature 只为读前台应用与按 pid
+# 找回它，都是同一个已编译 crate 里的模块，不引入新的三方依赖。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSWindow"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSWorkspace",
+    "NSRunningApplication",
+    "libc",
+] }
 
 [profile.release]
 codegen-units = 1

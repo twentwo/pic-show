@@ -60,4 +60,31 @@
 纯 `cargo build` 出来的 debug 二进制缺 `custom-protocol`，会去连 `devUrl`
 （localhost:1420），前端跑不起来 —— **真机验证必须同时起 `tools/serve.js`**。
 用 CGWindowList 观察窗口几何时要 `[.optionAll]`，全屏窗口被搬进了独立 Space，
-「在屏」那一档看不见它。
+「在屏」那一档看不见它。Space 切换、Finder 激活、全屏转场这类观感，沙箱/无 GUI
+会话测不了（探针里 `activate()` 会返回 false），只能按 README 步骤真机人工验收，
+且不要据此假报成功或失败。
+
+## 多桌面（Space）：「打开方式」退出后的桌面恢复
+
+macOS **没有公开 API** 指定「回到第 N 个桌面」（`CGS*` 私有，产品代码一行都不用）。
+唯一可靠做法是**激活那个桌面上的应用**（`NSRunningApplication.activateWithOptions:`），
+WindowServer 会把桌面、key window、焦点一起交还。根因不是全屏转场，而是
+LaunchServices 唤起时系统切到「包含该应用窗口的桌面」，冷启动隐藏的 `main`
+窗口被算在第一个 Space。
+
+硬约束：
+
+1. **捕获必须放在 `lib.rs::run()` 第一行**（`NSApplication` 初始化 / 应用被激活
+   **之前**）读 `NSWorkspace.frontmostApplication`；`RunEvent::Opened` 开头再
+   捕获一次。晚一步读到的就是 PicShow 自己（`tools/appkit_space_restore.swift`
+   实测）。读到自己是自己时保留旧记录，别覆盖来源。
+2. **交还只在「访达打开方式」一条路径**：`hand_back_launch_source` 要求
+   `was_launched() && space_restore_armed()` 双条件，`space_restore_armed` 只有
+   macOS `RunEvent::Opened` 会置起。命令行 argv、拖放、文件对话框、图片墙点开
+   全部走 `close_viewer → reveal_main_window()`，绝不顺手改它们的退出行为。
+3. **一次性**：`SOURCE_HANDED_BACK` 闸门防 `exit_app` 与 `ExitRequested` 叠加
+   切两次；新一次打开到来时复位。恢复用 `take()` 取一次即清空。
+4. **只用公开 API、绝不写窗口几何**：`pid + bundleIdentifier` 双标识防 pid
+   复用；来源应用找不到才回退访达；连访达都找不到就什么都不做。
+5. `exit_app` 顺序：先销毁全屏窗口 → 再交还前台 → 留 140ms 给异步激活落地 →
+   才 `app.exit(0)`。由 `tools/check_boot.mjs` 的多桌面断言组钉住。

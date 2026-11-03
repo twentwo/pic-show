@@ -49,8 +49,17 @@
 //! `tools/check_window_split.mjs` 会把这条钉住：一旦有人重新引入运行时切换装饰
 //! 或摆尺寸，检查直接失败。
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
+
+use objc2::rc::Retained;
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationOptions, NSRunningApplication, NSWorkspace,
+    NSWindowStyleMask, NSWindowTitleVisibility,
+};
 
 /**
  * 把窗口设成「内容铺满、标题栏透明」。
@@ -101,3 +110,164 @@ pub(crate) fn apply_immersive_frame() {
 // 实测数据留在 `tools/appkit_fullscreen_exit.swift`：`frame` 落到终值比
 // `didExit` 早约 530ms，正是旧方案里那一帧「空白窗口」的来源；而
 // `--close-in-fullscreen` 全程没有出现常规尺寸的可见帧。
+
+/* -------------------------------------------------------------------------- *
+ * 打开方式：退出预览后把桌面（Space）与焦点交还给触发打开的那个应用
+ * -------------------------------------------------------------------------- *
+ *
+ * ## 缺陷
+ *
+ * 用户在**非第一个 Space** 的访达里右键 →「打开方式」→ PicShow。PicShow 被
+ * LaunchServices 唤起、建一条全屏预览窗口（全屏窗口独占一个新 Space）。用户
+ * 关掉预览（`exit_app`，进程随之退出）之后，macOS 把用户送回了**第一个
+ * Space**，而不是触发打开操作时访达所在的那个：访达窗口与焦点都留在原处，
+ * 用户被丢到一个空桌面。
+ *
+ * 根因不在「退出全屏转场」，而在**激活**：应用被唤起时系统会切到「包含该应用
+ * 窗口的桌面」，而冷启动那条隐藏的 `main` 窗口被算在了第一个 Space；全屏窗口
+ * 销毁后 AppKit 回到「进入全屏前所在的 Space」，也就跟着回到了那一个。我们
+ * 拦不住系统那一次切换 —— macOS 没有公开 API 能指定「回到第 N 个桌面」。
+ *
+ * ## 做法：交还前台，让系统自己切回去
+ *
+ * 公开、可靠的「回到某个 Space」只有一条路：**激活那个 Space 上的应用**
+ * （`NSRunningApplication.activateWithOptions:`）。WindowServer 会把它窗口所在
+ * 的桌面切到前台，并把 key window / 焦点一并交还 —— 这正好同时满足「回到触发
+ * 打开操作时访达所在的 Space」与「保持访达窗口及焦点状态」。
+ *
+ * 于是只需在**打开发生的最早一刻**记下前台应用是谁，退出时激活它。
+ *
+ * `tools/appkit_space_restore.swift` 把两件事测成了事实：
+ *   * 进程第一行（`NSApplication` 尚未初始化、还没被激活）读到的
+ *     `frontmostApplication` **是触发打开的那个应用**，不是自己；等
+ *     `NSApplication` 初始化并激活之后就未必了 —— 所以捕获必须放在 `run()`
+ *     第一行；
+ *   * 记下的 pid 与 bundleIdentifier 能把那个应用找回来（`byPid` 命中）。
+ *   这台无 GUI 激活的会话里 `activate()` 返回 false，所以「激活能否切 Space」
+ *   这一环只能真机验收，探针不假报成功。
+ *
+ * ## 边界（改动刻意收得很窄）
+ *
+ *   * 只有「被外部要求看图」的会话（`AppState::was_launched()`）才恢复；
+ *     常规启动、从图片墙点开的预览走 `close_viewer` → `reveal_main_window()`，
+ *     一行都不碰；
+ *   * 恢复是一次性的（`take()`），同一进程里重复退出不会重复激活；
+ *   * 单桌面下「激活来源应用」等价于把焦点还给打开它的那个应用，与系统默认
+ *     一致，不改变用户看到的结果；
+ *   * 找不到来源应用（已退出、pid 被复用）时回退到访达：访达常驻，且正是
+ *     「打开方式」最常见的来源。连访达都找不到就什么也不做，绝不乱激活。
+ * -------------------------------------------------------------------------- */
+
+/// 触发「打开方式」的那个应用。只在沉浸式会话退出时取用一次。
+static LAUNCH_SOURCE: Mutex<Option<LaunchSource>> = Mutex::new(None);
+/// 本次会话是否已经交还过前台。
+///
+/// `exit_app` 与 `RunEvent::ExitRequested` 可能落在同一次退出上（取决于
+/// `app.exit(0)` 会不会再走一遍事件回调）。没有这道闸门，第二次调用会在
+/// `LAUNCH_SOURCE` 已被 `take()` 清空后走「回退访达」，把刚交还出去的桌面又
+/// 切一次。`capture_launch_source()` 在新一次打开到来时把它复位。
+static SOURCE_HANDED_BACK: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone)]
+struct LaunchSource {
+    /// `libc::pid_t`（macOS 上即 i32）。
+    pid: i32,
+    /// 双标识：pid 可能被复用，激活前必须再对一次 bundleIdentifier。
+    bundle_id: Option<String>,
+}
+
+fn debug_enabled() -> bool {
+    std::env::var("PICSHOW_DEBUG").is_ok()
+}
+
+/// 在**尽可能早**的时刻记下前台应用。
+///
+/// 由 `lib.rs::run()` 的第一行（`NSApplication` 还没初始化）与
+/// `RunEvent::Opened` 的开头各调一次。读到的是自己时**保留已有记录**：那说明
+/// 应用已经被激活了，这次读不到触发者，但更早那次（冷启动第一行）读到了。
+pub(crate) fn capture_launch_source() {
+    // 新的一次「打开方式」开始了：允许这次会话结束时再交还一次前台
+    SOURCE_HANDED_BACK.store(false, Ordering::Relaxed);
+    let ws = NSWorkspace::sharedWorkspace();
+    let Some(front) = ws.frontmostApplication() else { return };
+    let pid = front.processIdentifier();
+    if pid == std::process::id() as i32 {
+        return;
+    }
+    let bundle_id = front.bundleIdentifier().map(|s| s.to_string());
+    if debug_enabled() {
+        eprintln!(
+            "[picshow] 记录打开来源：pid={pid} bundle={}",
+            bundle_id.as_deref().unwrap_or("(无)")
+        );
+    }
+    if let Ok(mut slot) = LAUNCH_SOURCE.lock() {
+        *slot = Some(LaunchSource { pid, bundle_id });
+    }
+}
+
+/// 把前台 / 桌面 / 焦点交还给触发打开的那个应用。
+///
+/// @returns 是否真的发出了激活请求（调用方据此决定要不要给一小段落地时间）
+pub(crate) fn restore_launch_source() -> bool {
+    // 一次会话只交还一次（见 SOURCE_HANDED_BACK 的注释）
+    if SOURCE_HANDED_BACK.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    let source = LAUNCH_SOURCE.lock().ok().and_then(|mut slot| slot.take());
+    let target = source
+        .as_ref()
+        .and_then(find_by_identity)
+        .or_else(find_finder);
+
+    let Some(app) = target else {
+        if debug_enabled() {
+            eprintln!("[picshow] 找不到打开来源应用，跳过桌面/焦点交还");
+        }
+        return false;
+    };
+    let ok = app.activateWithOptions(NSApplicationActivationOptions::empty());
+    if debug_enabled() {
+        eprintln!(
+            "[picshow] 交还前台给 {}（pid={}）：activate={ok}",
+            app.bundleIdentifier()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            app.processIdentifier()
+        );
+    }
+    ok
+}
+
+/// 按 pid 找回，并核对 bundleIdentifier —— pid 复用时旧 pid 可能指向别的应用。
+fn find_by_identity(source: &LaunchSource) -> Option<Retained<NSRunningApplication>> {
+    let app = NSRunningApplication::runningApplicationWithProcessIdentifier(source.pid)?;
+    if same_identity(&app, source) {
+        Some(app)
+    } else {
+        None
+    }
+}
+
+fn same_identity(app: &NSRunningApplication, source: &LaunchSource) -> bool {
+    if app.processIdentifier() != source.pid {
+        return false;
+    }
+    let now = app.bundleIdentifier().map(|s| s.to_string());
+    match (&source.bundle_id, now) {
+        // 当初没读到 bundleIdentifier（无 Info.plist 的进程）：只认 pid
+        (None, _) => true,
+        (Some(want), Some(got)) => want == &got,
+        // 当初有、现在读不到：宁可不用，免得激活到一个已经不是它的进程
+        (Some(_), None) => false,
+    }
+}
+
+/// 兜底：来源应用已经不在了，就交还给访达（「打开方式」最常见的来源）。
+fn find_finder() -> Option<Retained<NSRunningApplication>> {
+    let apps = NSWorkspace::sharedWorkspace().runningApplications();
+    apps.to_vec().into_iter().find(|app| {
+        app.bundleIdentifier().map(|s| s.to_string()).as_deref()
+            == Some("com.apple.finder")
+    })
+}

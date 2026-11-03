@@ -201,28 +201,58 @@ button {
 }
 
 /* --------------------------------------------------------------------------
-   顶栏
+   顶栏 —— 图片墙唯一的顶部区域
+   --------------------------------------------------------------------------
+
+   标题栏信息（品牌 + 名称）、工具栏操作（打开图片 / 打开文件夹 / 主题）与
+   状态信息合并进**同一条连续的水平区域**：页面里只有这一个 `header.topbar`，
+   没有第二条标题栏，也没有另起一行 / 另起一块的独立工具栏。`.topbar-sep`
+   只是这条区域内部的分组分隔线，不是新的一条栏。
+
+   系统那条标题栏是透明且隐藏标题文字的（`FullSizeContentView`），它只贡献
+   左上角三个交通灯；自绘区域从窗口最上边缘连续铺满 `--topbar-h`，用左侧
+   padding 给交通灯让位。于是「标题栏」与「工具栏」在视觉上是一整条，不再
+   分层、也不重复。
+
+   视觉层级分三级，全部落在同一条栏内：
+     * 主层级 `.brand`   —— logo + 加粗名称；
+     * 交互层级 `.topbar-actions` —— 三个操作按钮；
+     * 辅助层级 `.topbar-status`  —— 次要色、可收缩的状态文字。
+   三级共用一组间距（`--topbar-gap`）、同一种垂直对齐（`align-items: center`）、
+   一条底色与一条底边框，所以窗口缩放时它们始终像同一块区域在整体收紧。
+
+   `flex-wrap: nowrap` 是硬要求：栏里任何一项换行都会把实际高度撑过
+   `--topbar-h`，而下面 `.grid` / `.empty` 的 `inset` 是按这个变量算的 —— 一
+   换行，内容区就会被压住一块。窄窗口靠「收紧间距 + 状态文字省略 / 让位」
+   腾地方，绝不靠换行或压缩操作按钮。
    -------------------------------------------------------------------------- */
 
 .topbar {
+  /* 合并区域的统一间距。定义在规则自身（不进主题令牌块）：标题信息、工具栏、
+     状态与拖拽留白都用它，窄窗口只改这一个值就能整体收紧。 */
+  --topbar-gap: 14px;
   position: relative;
   z-index: 10;
   height: var(--topbar-h);
   display: flex;
   align-items: center;
-  gap: 18px;
+  flex-wrap: nowrap;
+  gap: var(--topbar-gap);
   /* 左侧让给 macOS 的交通灯（其它平台为 0，不留空） */
   padding: 0 14px 0 calc(14px + var(--traffic-light-inset));
+  /* 唯一的一条底色与唯一的一条分隔线：整块区域是一个视觉整体 */
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   user-select: none;
 }
 
+/* ① 标题栏信息：主层级，同时是可拖拽区 */
 .brand {
   display: flex;
   align-items: center;
   gap: 9px;
   flex: none;
+  min-width: 0;
 }
 
 .logo {
@@ -235,29 +265,52 @@ button {
 .appname {
   font-weight: 600;
   letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 
+/* ② 分组分隔：同一条连续区域内「标题信息 → 工具栏操作」的一级层级。
+   一条竖细线，不占额外一行、也不是第二条栏。 */
+.topbar-sep {
+  flex: none;
+  width: 1px;
+  height: 20px;
+  background: var(--border-strong);
+}
+
+/* ③ 工具栏操作入口：全部按钮都在这一组里，不再另设独立工具栏。
+   `flex: none` 保证窗口再窄也不压缩操作入口。 */
 .topbar-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
+  flex: none;
 }
 
-/* 顶栏上的可拖拽空白区（内部绝不能放交互元素） */
+/* ④ 连续区域内的可拖拽留白：把辅助信息推到右侧，本身仍是这条栏的一部分
+   （内部绝不能放交互元素，理由见 index.html 的注释）。 */
 .topbar-drag {
   flex: 1 1 auto;
   align-self: stretch;
   min-width: 12px;
 }
 
+/* ⑤ 辅助信息层级：状态 / 缓存。窗口变窄时它先让位（可收缩 + 省略号），
+   保证上面的标题信息与操作入口始终完整。对齐方式与整条栏统一为 center。 */
 .topbar-status {
-  flex: none;
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
+  flex: 0 1 auto;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar-status > span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1072,9 +1125,12 @@ body.is-dragging::after {
     --chrome-top: 50px;
   }
 
+  /* 合并顶栏：整体收紧，仍是一条连续的水平区域，绝不换行。
+     左侧仍保留交通灯让位 —— 只收窄基础 padding，不能把 inset 一起抹掉，
+     否则 macOS 窄窗口上三个圆点会压住品牌名。 */
   .topbar {
-    gap: 10px;
-    padding: 0 10px;
+    --topbar-gap: 10px;
+    padding: 0 10px 0 calc(10px + var(--traffic-light-inset));
   }
 
   /* 窄屏放不下状态栏文字，优先保住按钮 */
@@ -1120,6 +1176,30 @@ body.is-dragging::after {
 
   .empty-inner {
     max-width: none;
+  }
+}
+
+/* 再窄（main 窗口最小宽度 460px）：辅助层级进一步让位，标题信息与三个操作
+   入口始终完整。分隔线收起、间距与留白收紧、按钮内边距减小；状态文字靠
+   `min-width: 0` 自动省略，窗口变宽就完整回来。这条栏仍只有一行、高度仍是
+   `--topbar-h`，下面内容区的 `inset` 不会错位。 */
+@media (max-width: 520px) {
+  .topbar {
+    --topbar-gap: 8px;
+  }
+
+  .topbar-sep {
+    display: none;
+  }
+
+  /* 留白可缩到 0，把宽度让给操作组；它本身不含任何交互元素 */
+  .topbar-drag {
+    min-width: 0;
+  }
+
+  /* 只收紧顶栏里的按钮，空状态那组按钮不受影响 */
+  .topbar-actions .btn {
+    padding: 0 8px;
   }
 }
 

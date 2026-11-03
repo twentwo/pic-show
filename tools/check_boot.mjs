@@ -535,6 +535,89 @@ ok(
     )
 );
 
+/* ---------------- 4. 多桌面：打开方式的桌面交还 ---------------- */
+
+console.log('\n多桌面：打开方式退出后把桌面与焦点交还给触发者');
+
+// 根因：macOS 没有公开 API 指定「回到第 N 个桌面」，唯一可靠的做法是**激活
+// 那个桌面上的应用**，让 WindowServer 把桌面与 key window 一起交还。于是必须
+// 有「最早时刻记下前台应用」和「退出时激活它」两半，缺一不可；改动还要被钉
+// 死在 Finder 打开方式这一条路径上，别连累常规启动 / 命令行 / 图片墙。
+ok(
+  'run() 第一行（NSApplication 初始化 / build 之前）就捕获前台应用',
+  (() => {
+    const capture = libCode.indexOf('crate::macos::capture_launch_source()');
+    const build = libCode.indexOf('tauri::Builder::default()');
+    const cli = libCode.indexOf('commands::argv_targets()');
+    return capture > 0 && capture < build && capture < cli;
+  })()
+);
+ok(
+  'RunEvent::Opened 里再捕获一次，并只给这条通道 arm 桌面交还',
+  /RunEvent::Opened \{ urls \}[\s\S]{0,600}?capture_launch_source\(\);[\s\S]{0,300}?arm_space_restore\(\);/.test(
+    libCode
+  ) && (lib.match(/arm_space_restore\(\)/g) || []).length === 1
+);
+ok(
+  '交还只在 macOS 且「打开方式」会话才动作（命令行 / 拖放 / 图片墙一律跳过）',
+  /pub fn hand_back_launch_source\(app: &AppHandle\) -> bool \{[\s\S]*?#\[cfg\(target_os = "macos"\)\][\s\S]*?!state\.was_launched\(\) \|\| !state\.space_restore_armed\(\)/.test(
+    commandsCode
+  )
+);
+ok(
+  'exit_app 顺序：先销毁全屏窗口 → 再交还前台 → 才 app.exit(0)',
+  /pub fn exit_app\(app: AppHandle\) \{[\s\S]*?release_viewer_now\(&app\);[\s\S]*?hand_back_launch_source\(&app\)[\s\S]*?app\.exit\(0\);/.test(
+    commandsCode
+  )
+);
+ok(
+  '进程退出兜底（ExitRequested）也交还，且排在销毁预览窗口之后',
+  /RunEvent::ExitRequested \{[\s\S]*?release_viewer_now\(handle\);[\s\S]*?hand_back_launch_source\(handle\);/.test(
+    libCode
+  )
+);
+ok(
+  '交还是一次性的（exit_app 与 ExitRequested 叠加也不会切两次桌面）',
+  /SOURCE_HANDED_BACK\.swap\(true, Ordering::Relaxed\)/.test(macosCode) &&
+    /SOURCE_HANDED_BACK\.store\(false, Ordering::Relaxed\)/.test(macosCode)
+);
+ok(
+  '恢复走公开的 activateWithOptions（不碰私有 CGS API、不写窗口几何）',
+  /activateWithOptions\(NSApplicationActivationOptions::empty\(\)\)/.test(
+    macosCode
+  ) && !/CGSManagedDisplay|CGSCopyManaged|set_frame|setFrame/.test(macosCode)
+);
+ok(
+  'pid + bundleIdentifier 双标识校验，防 pid 被复用后激活到别的应用',
+  /runningApplicationWithProcessIdentifier\(source\.pid\)/.test(macosCode) &&
+    /fn same_identity\(/.test(macosCode) &&
+    /\(Some\(want\), Some\(got\)\) => want == &got/.test(macosCode)
+);
+ok(
+  '来源应用找不到时回退到访达（打开方式最常见的来源）',
+  /fn find_finder\(\)/.test(macosCode) && /"com\.apple\.finder"/.test(macosCode)
+);
+ok(
+  '常规预览关闭（close_viewer → reveal_main_window）没有被塞进桌面交还',
+  (() => {
+    const start = commandsCode.indexOf('pub fn close_viewer(');
+    const end = commandsCode.indexOf('pub(crate) fn release_viewer(', start);
+    const body = start >= 0 && end > start ? commandsCode.slice(start, end) : '';
+    return body.length > 0 && !/hand_back_launch_source|restore_launch_source/.test(body);
+  })()
+);
+ok(
+  '只在 macOS target 引入 NSWorkspace / NSRunningApplication / libc feature',
+  /features = \[[\s\S]*?"NSWorkspace",[\s\S]*?"NSRunningApplication",[\s\S]*?"libc"/.test(
+    read('src-tauri/Cargo.toml')
+  )
+);
+ok(
+  '仓库里留有可复跑的 Space 恢复平台探针',
+  /frontmostApplication/.test(read('tools/appkit_space_restore.swift')) &&
+    /activate\(options/.test(read('tools/appkit_space_restore.swift'))
+);
+
 /* ---------------- 汇总 ---------------- */
 
 if (problems) {
