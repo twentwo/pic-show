@@ -39,10 +39,12 @@
       adopt(viewerDoc);
 
       // 无头环境拿不到合成帧，Web Animations 永不 finished。
-      // 换成「立刻完成」的替身：动画的终值本来就是代码预写进 inline style 的，
-      // 所以状态与布局依然真实，只是省掉了 300ms 的过程。
+      // 换成「立刻完成」的替身：轨道落位 / 回弹动画现在把**起点**写进 inline
+      // style、动画用 fill:'forwards'，终值在 finished 回调里提交回 inline 再
+      // cancel —— 这里让 finished 立即兑现，那一步提交照常发生，所以状态与
+      // 布局依然真实，只是省掉了那 180~300ms 的合成过程。
       // 顺带把**每次调用的参数**记下来 —— 15 节要靠它核对启动动画的起点、
-      // 时长与缓动（这些是 CSS 之外的部分，不看调用就断言不到）。
+      // 时长与缓动；17.1f3 靠它核对落位动画的起点/终点两帧与 fill。
       const animations = [];
       Element.prototype.animate = function (keyframes, options) {
         animations.push({ el: this, keyframes, options });
@@ -1542,7 +1544,7 @@
         `index=${viewer.index} swipeX=${viewer.g.swipeX}`
       );
 
-      // 17.1f 甩：一段流还没停就该切图（不等静默窗口 = 不迟钝）
+      // 17.1f 甩：流中间不插收尾，画面全程跟手；流停了才吸附补完最后一张
       await twOpen(2);
       const quickBefore = viewer.index;
       for (let i = 0; i < 4; i += 1) {
@@ -1550,11 +1552,28 @@
         wheel({ deltaX: 40, deltaY: 0 });
       }
       ok(
-        '17.1f 甩到门槛就在流里切图（不陪惯性尾巴耗时间）',
+        '17.1f 甩的过程中画面跟手、不插逐张收尾',
+        viewer.index === quickBefore && Math.abs(viewer.g.swipeX + 160) < 2,
+        `index=${viewer.index} swipeX=${viewer.g.swipeX}`
+      );
+      await settle();
+      ok(
+        '17.1f2 流停下来吸附补完最后一张',
         viewer.index === quickBefore + 1,
         `${quickBefore} → ${viewer.index}`
       );
-      await settle();
+      // 17.1f3 落位动画：起点先落地、fill:'forwards'（动画期间由关键帧接管，
+      //      跑完在 finished 里把终值提交回 inline）。替身让 finished 立即兑现，
+      //      所以这里核对「调用参数」即可，不用等 300ms 的合成帧。
+      const land17 = lastOf(viewer.track);
+      ok(
+        '17.1f3 落位动画起点/终点两帧 + fill:forwards（不闪到终点、不闪回起点）',
+        land17?.options?.fill === 'forwards' &&
+          Array.isArray(land17.keyframes?.transform) &&
+          land17.keyframes.transform.length === 2 &&
+          land17.keyframes.transform[0] !== land17.keyframes.transform[1],
+        `fill=${land17?.options?.fill} kf=${JSON.stringify(land17?.keyframes?.transform)}`
+      );
 
       // 17.1g 起手噪声不能把整段横滑钉成缩放（「第一次滑不动」的真因）
       await twOpen(2);
@@ -1574,41 +1593,47 @@
         `index ${noiseBefore} → ${viewer.index}，scale=${viewer.g.scale.toFixed(3)}`
       );
 
-      // 17.2 一次手势只翻一张：推得再远也不连翻（上一版连翻的回归用例）
+      // 17.2 连续跨多张：一屏 = 一张，推得越远跨得越多（旧契约「一次只翻一张」
+      //      已反转）。delta 按视口宽取，两种窗口尺寸下都能稳定跨过 ≥2 张。
       await twOpen(1);
       const longBefore = viewer.index;
+      const step17 = Math.max(20, Math.ceil(viewer.slotWidth() / 12));
       for (let i = 0; i < 40; i += 1) {
         await sleep(16);
-        wheel({ deltaX: 25, deltaY: 0 }); // 推的阶段：每帧 25px，连推 40 帧
+        wheel({ deltaX: step17, deltaY: 0 });
       }
       for (const d of [22, 19, 16, 13, 10, 8, 6, 4, 3, 2]) {
         await sleep(16);
         wheel({ deltaX: d, deltaY: 0 });
       }
       ok(
-        '17.2a 一次长距离横滑（推 + 惯性尾巴）只翻一张',
-        viewer.index === longBefore + 1,
+        '17.2a 一次长距离横滑连续跨过至少两张（不再只翻一张）',
+        viewer.index >= longBefore + 2,
         `${longBefore} → ${viewer.index}`
       );
       ok(
-        '17.2b 结算之后落锁（同一段不再重来）',
-        viewer.g.wheelSwipe.locked === true,
+        '17.2b 不再有 locked 状态（惯性尾巴不会被吞掉）',
+        viewer.g.wheelSwipe.locked === undefined,
         String(viewer.g.wheelSwipe.locked)
       );
 
-      // 17.2c 同一段还没停（中间没有静默）就继续堆位移，也不会多给一张
-      for (let i = 0; i < 10; i += 1) {
+      // 17.2c 同一段还没停（中间没有静默）就继续堆位移，会继续推进
+      const midLong = viewer.index;
+      for (let i = 0; i < 20; i += 1) {
         await sleep(16);
-        wheel({ deltaX: 25, deltaY: 0 });
+        wheel({ deltaX: step17, deltaY: 0 });
       }
       ok(
-        '17.2c 同一段里继续堆位移不连翻',
-        viewer.index === longBefore + 1,
-        `${longBefore} → ${viewer.index}`
+        '17.2c 同一段里继续堆位移继续推进（连续语义）',
+        viewer.index > midLong,
+        `${midLong} → ${viewer.index}`
       );
       await settle(400);
 
       // 17.3 抬手（静默）之后再滑：必须立刻还能翻 —— 「不灵敏」的回归点
+      //      17.2 已经把索引推到后半段了，这里重新起一个干净的场景，免得撞到
+      //      图库末尾把「还能翻」误判成「到头了」。
+      await twOpen(1);
       const chainBefore = viewer.index;
       await swipeOnce(1);
       await settle();

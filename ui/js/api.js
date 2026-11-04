@@ -208,6 +208,46 @@ const MAX_KEPT = 12;
 const kept = [];
 
 /**
+ * 同 URL 的预取只做一次。
+ *
+ * 连续横滑沿方向预热多张时，相邻几次推进的预热窗口是**重叠**的（推到第 n 张时，
+ * 第 n-1、n-2 张也在窗口里）。若每次都新建 Image 再 decode，同一张 4K 原图会在
+ * 一段流里被解码十几遍，而且这些解码恰好落在跟手阶段 —— 预热自己反倒成了卡顿源。
+ * 复用同一份已解码结果即可；容量同样用 FIFO 控制，失败时允许下次重试。
+ */
+const MAX_PREFETCHED = 48;
+const prefetched = new Map();
+
+/**
+ * 已解码、可以**直接挂进 DOM** 的图片，按 URL 存一份。
+ *
+ * 预取只让字节与位图提前到位还不够：`viewer.fill()` 给槽里的 <img> 重新设
+ * src 时，浏览器仍要走一次「请求 → 解码 → 绘制」。连续横滑时刚轮转进来的
+ * 槽离视口只有一两屏，这一两帧就会露成空白，看起来正是「邻图没跟着移入」。
+ * 这里把已经 `decode()` 过的 <img> 元素本身留着，调用方 `takeDecoded()` 取走
+ * 后直接替换进槽 —— 同一帧就有像素，没有网络、没有解码、没有空白帧。
+ *
+ * 取走即从缓存移除（一个 <img> 只能挂在一个地方）；容量 FIFO 控制，避免
+ * 无限占内存。失败不进池，换一段流自然重试。
+ */
+const MAX_DECODED = 24;
+const decoded = new Map();
+
+/**
+ * 取走一张已解码的图片节点；没有（或已被取走）返回 null。
+ * @param {string} src
+ * @returns {HTMLImageElement|null}
+ */
+export function takeDecoded(src) {
+    const img = decoded.get(src);
+    if (!img || img.parentNode) return null;
+    decoded.delete(src);
+    const at = kept.indexOf(img);
+    if (at >= 0) kept.splice(at, 1);
+    return img;
+}
+
+/**
  * 预加载一张图片（不阻塞、不抛错）。
  * @param {string} src
  * @param {'high'|'low'|'auto'} priority
@@ -215,6 +255,9 @@ const kept = [];
  */
 export function preload(src, priority = 'low') {
     if (!src) return Promise.resolve(null);
+
+    const cached = prefetched.get(src);
+    if (cached) return cached;
 
     const img = new Image();
     img.decoding = 'async';
@@ -230,17 +273,33 @@ export function preload(src, priority = 'low') {
             // 一张 4K 原图能占住主线程十几毫秒 —— 正好卡在切图动画的第一帧，
             // 看起来就是「切过去的瞬间顿一下」。这里显式 decode 一次把位图
             // 提前准备好（decode 失败不影响流程，回退到原来的懒解码即可）。
-            const done = () => resolve(img);
+            const done = () => {
+                decoded.set(src, img);
+                while (decoded.size > MAX_DECODED) {
+                    decoded.delete(decoded.keys().next().value);
+                }
+                resolve(img);
+            };
             if (typeof img.decode === 'function') img.decode().then(done, done);
             else done();
         };
-        img.onerror = () => resolve(null);
+        img.onerror = () => {
+            // 取失败别把「失败」缓存住：换一段流、路径恢复之后要能重试。
+            // 只删自己那一条，别误删 FIFO 淘汰后同 URL 的新一次预取。
+            if (prefetched.get(src) === promise) prefetched.delete(src);
+            resolve(null);
+        };
     });
 
     img.src = src;
 
     kept.push(img);
     while (kept.length > MAX_KEPT) kept.shift();
+
+    prefetched.set(src, promise);
+    while (prefetched.size > MAX_PREFETCHED) {
+        prefetched.delete(prefetched.keys().next().value);
+    }
 
     return promise;
 }

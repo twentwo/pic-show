@@ -114,35 +114,20 @@ const WHEEL_GESTURE_GAP_MS = 600;
  */
 const WHEEL_SWIPE_DEADZONE = 8;
 /**
- * 跟手推出去超过轨道宽度的这个比例，**当场结算**，不再等这一段的流停下来。
- * 已经拖过半张图，意图不可能有别的解释；再让用户等 60ms 才动，就是「迟钝」。
- */
-const WHEEL_COMMIT_RATIO = 0.5;
-/**
- * 「甩」的即时结算门槛：位移到这么多 **且** 当前速度仍在阈值之上，立刻结算。
+ * 首尾阻尼的位移上限（px）。
  *
- * 用**当前**速度而不是峰值 —— 峰值一出现就永远为真，会让「慢慢拖出去再停住」
- * 也按甩处理；当前速度则如实反映「手还在快速划」。
- *
- * 48px 是「跟手」与「立刻响应」的分界：慢拖要一路跟到半张图（`WHEEL_COMMIT_RATIO`）
- * 或松手才结算，而真正的甩在这个距离上已经足够表达意图，再跟下去只是浪费延迟。
- */
-const WHEEL_FAST_COMMIT_PX = 48;
-/**
- * 判「甩」的速度门槛（px/ms）。
- *
- * 比单指松手那个 `SWIPE_VELOCITY = 0.45` 高一倍多：触控板一条斜线划下来，
- * 中速滑动的瞬时速度就有 0.4~0.8，拿 0.45 当门槛会让**大部分**正常滑动都在
- * 48px 处就被判成甩 —— 画面只跟了 3% 就飞走，观感反而更不跟手。取 1.1
- * （≈ 每 16ms 走 18px）才是「明显是在甩」。
- */
-const WHEEL_FLICK_VELOCITY = 1.1;
-/**
- * 跟手推出去超过一屏之后，多出来的行程衰减到这么多为止。
- * 轨道只有「上一张 / 当前 / 下一张」三个槽，再拖也没有第四个槽可显示 ——
- * 不做限制会把黑边拉进来。
+ * 两个用途：`wheelFollowOffset()` 把超过一屏的行程衰减到这个量级；到首尾
+ * （`onWheelAdvance` 返回 false）时把累计夹到它 —— 轨道只有「上一张 / 当前 /
+ * 下一张」三个槽，首尾视口外那个槽是空的，推过去太多会把黑边拉进来。
  */
 const WHEEL_OVERSCROLL_RUBBER = 90;
+/**
+ * 单个 wheel 事件最多连续推进几张。
+ *
+ * 正常触控板一帧的 delta 远不到一屏；异常设备 / 合成器可能一次丢出跨好几屏
+ * 的增量。给个上限，免得一个事件把整个图库跳完、顺带发出几十次取图请求。
+ */
+const WHEEL_ADVANCE_MAX = 8;
 /**
  * 结算时若碰上切换动画还在跑（`enabled === false`），隔这么久再试一次，
  * 而不是直接这一次手势丢掉。
@@ -150,16 +135,6 @@ const WHEEL_OVERSCROLL_RUBBER = 90;
 const WHEEL_SETTLE_RETRY_MS = 60;
 /** 上面那个重试的总预算：超过就直接回弹，不能把轨道停在半张图上 */
 const WHEEL_SETTLE_MAX_MS = 600;
-/**
- * 反向再出发所需的**累积行程**（不是单次增量）。
- * 同一次惯性流不会自己掉头，掉头且攒够一段行程就是用户换了方向重推。
- */
-const WHEEL_REVERSE_TRAVEL = 60;
-/**
- * 一段流里已经翻过一张之后的硬上限。兜底用：万一某个设备/驱动的尾巴异常长，
- * 也不能把用户永久锁死 —— 超过这个时长就按新手势处理。
- */
-const WHEEL_LOCK_MAX_MS = 1200;
 /**
  * 视口右边缘留给 macOS 通知中心的宽度。
  * 从右边缘起手的横向滑动系统会拉出通知中心，此时若我们也切图就成了「两头
@@ -189,7 +164,16 @@ export class Gestures {
       onDismissProgress: () => {},
       onDismissRelease: () => {},
       onSwipeRelease: () => {},
+      /**
+       * 连续横滑：累计位移每跨过一整屏就同步换一张。返回 false = 到首尾了。
+       * 调用方必须**不播收尾动画、不重建手势、不设闸门**，只轮转三槽的内容、
+       * 推进索引并把基准归位；换页那一帧的视觉位置由本类随后写回，画面不跳。
+       */
+      onWheelAdvance: () => true,
+      /** 流结束吸附：补完最后一张（从当前跟手位置接着播），与单指同一条收尾 */
       onWheelSwipe: () => {},
+      /** 一段流结算完：通知调用方把当前项的原图 / 邻图补给上 */
+      onWheelRest: () => {},
       /** 横滑方向一确定就通知（用来提前取/解码邻图），参数同 onWheelSwipe */
       onSwipeIntent: () => {},
       onTap: () => {},
@@ -309,8 +293,15 @@ export class Gestures {
   }
 
   /**
-   * 轨道回弹 / 归位。与 `animateTo` 同样的技巧：先把终值写进 inline style，
-   * 动画 `fill:'none'`，结束瞬间样式天然接续，不会闪回起点。
+   * 轨道回弹 / 归位。
+   *
+   * 与 `viewer.animateTrack` 同一套提交方式：**起点**先写进 inline style，动画
+   * `fill:'forwards'`，终点在 finished 里提交并 cancel。以前把终值先写进 inline、
+   * 用 `fill:'none'` 靠关键帧盖住起点，收尾虽不闪回，但关键帧采样前那一帧显示的
+   * 是 inline 的终点 —— 每次回弹都先「闪到终点再弹回起点」。起点落地之后两端都不跳。
+   *
+   * 被 `cancelAnim()`（下一段跟手 / 新的 pointerdown）掐掉时 `this.anim` 已经不是
+   * 这一次，提交分支直接跳过，终值不会写回一个已经被接管的轨道。
    */
   animateTrackTo(swipeX, duration = 260, easing = EASE_OUT) {
     if (!this.o.track) return Promise.resolve();
@@ -321,23 +312,33 @@ export class Gestures {
     const to = `translate3d(${base + swipeX}px, 0, 0)`;
 
     this.swipeX = swipeX;
+    this.o.track.style.transform = from;
+
     if (duration <= 0 || from === to) {
-      this.applyTrack();
+      this.o.track.style.transform = to;
       return Promise.resolve();
     }
 
     const anim = this.o.track.animate(
       { transform: [from, to] },
-      { duration, easing, fill: 'none' }
+      { duration, easing, fill: 'forwards' }
     );
     this.anim = anim;
-    this.applyTrack();
 
     return anim.finished
       .then(() => {
+        if (this.anim !== anim) return;
+        this.o.track.style.transform = to;
+        try {
+          anim.cancel();
+        } catch {
+          /* 已结束的动画忽略 */
+        }
         this.anim = null;
       })
-      .catch(() => {});
+      .catch(() => {
+        if (this.anim === anim) this.anim = null;
+      });
   }
 
   emit() {
@@ -357,9 +358,13 @@ export class Gestures {
   }
 
   /**
-   * 动画到目标变换。
+   * 动画到目标变换（**当前 slide 的缩放 / 平移**，不是轨道位移）。
    * 技巧：动画一开始就先把终值写进 inline style；动画 fill:'none'，
    * 结束后样式自然接续，不会出现「闪回起点」的那一帧。
+   *
+   * 注意与轨道落位 / 回弹（`viewer.animateTrack()` / `animateTrackTo()`）区分：
+   * 那两条跑在同一个 track 上、随时会被下一段手势接管，所以必须**起点**落地 +
+   * `fill:'forwards'` + finished 提交终值；这里没有接管问题，终值预写反而最省事。
    */
   animateTo({ scale, tx, ty }, duration = 260, easing = EASE_OUT) {
     this.cancelAnim();
@@ -422,6 +427,20 @@ export class Gestures {
     const ty = clamp(this.rawY, -bounds.maxY, bounds.maxY);
     this.swipeX = 0;
     this.commit({ scale, tx, ty });
+  }
+
+  /**
+   * 连续换页后把「变换目标」指向新的当前槽，**不重建实例**。
+   *
+   * 事件监听挂在 `track`（铺满视口）上，与 `el` 无关；横滑本身也只写 track。
+   * 但换页之后当前 slide 换了，后续任何缩放 / 平移 / 回弹必须落在新的那张上
+   * —— 若不换，手势会一直作用在已经轮转到视口外的旧槽上。
+   *
+   * 不直接重建 `Gestures`：连续流里每跨一张都重建一次，正是「连续快滑卡顿、
+   * 反馈延迟累积」的来源。
+   */
+  retarget(el) {
+    if (el && el !== this.el) this.el = el;
   }
 
   /** 回到适配尺寸 */
@@ -871,7 +890,7 @@ export class Gestures {
   }
 
   /**
-   * 触控板双指横向滑动 → 上一张 / 下一张（未放大）/ 横向平移（已放大）。
+   * 触控板双指横向滑动 → 一段**连续的滚动流**（未放大）/ 横向平移（已放大）。
    *
    * 为什么在这里而不是 pinch 分支里：Mac 的多指手势到 DOM 之前就被系统翻译
    * 成了 wheel / ctrl+wheel / click，`pointers.size >= 2` 那条 pinch 分支在
@@ -880,10 +899,11 @@ export class Gestures {
    * 方向约定与其他入口一致：内容跟着手指走。deltaX > 0 表示内容向左移动
    * （等同于手指向左划）→ 下一张。
    *
-   * 横向这条路与单指拖拽共用同一套结算判据（见 `settleWheelSwipe`）：画面先跟着
-   * 手指走，等这一段的 wheel 流停下来（相当于抬手）再决定要不要翻页。多指手势
-   * 同样是这条入口 —— 它在到达 DOM 之前就被系统翻译成了 wheel，`pointers` 里
-   * 永远凑不出第二根手指。
+   * 与旧实现最大的不同：这里不再「一段流最多结算一次」。`t.x` 是一个**连续
+   * 的位置**，每跨过一整屏就通过 `onWheelAdvance` 同步换一张（不播收尾动画、
+   * 不重建手势、不落锁），余下的位移继续 1:1 跟手 —— 系统投递的惯性尾巴因此
+   * 能一路把画面推过多张，不会在翻过第一张后停住。等流真正停下来，才由
+   * `settleWheelSwipe` 按剩余位置与速度吸附到某一张。
    *
    * @returns {boolean} true = 这次输入已被横向路径认领，调用方不要再当纵向处理。
    *   注意「认领」不等于「消费」：还在虚按噪点里时不调用 preventDefault，
@@ -894,7 +914,7 @@ export class Gestures {
     const prev = this.wheelSwipe;
     const sincePrev = now - prev.at;
 
-    // 静置太久 → 换了手势，累积、速度、反向行程、结算标记全部作废。
+    // 静置太久 → 换了手势，累积、速度、结算标记全部作废。
     // 顺序要紧：必须在**重新取** this.wheelSwipe 之前重置，否则 s 会指向刚被
     // 丢掉的那个对象 —— 每个事件都从 0 开始累加，位移永远攒不够。
     if (sincePrev > WHEEL_GESTURE_GAP_MS) this.resetWheelSwipe();
@@ -902,19 +922,12 @@ export class Gestures {
     s.at = now;
 
     // 静默超过「流结束」的刻度（65ms）—— 与结算用的是同一个刻度，所以这一刻
-    // 上一段手势必然已经结算过（翻页或回弹）。位移、速度、接管偏移都要作废：
-    //   - `base` 残留 → 下一段不再去接管新动画，跟手整整错开一屏；
-    //   - `peakV` 残留 → 慢慢拖也会被上一段的峰值判成「甩」，一碰就翻。
+    // 上一段手势必然已经结算过（补完一张或回弹）。位移、速度、接管偏移都要
+    // 作废：`base` 残留会让下一段不再接管新动画、跟手错开一屏；`peakV` 残留
+    // 会让慢慢拖被上一段的峰值判成「甩」。
     // 轴向与视口宽特意留着：手还是同一类滑动，没必要再攒 10px 判一次轴。
-    // 65~600ms 这段窗口正是「抬手之后马上又滑」的常态，漏掉就是「第二下不跟手」。
-    if (sincePrev >= WHEEL_GESTURE_END_MS) {
-      s.x = 0;
-      s.base = null;
-      s.vx = 0;
-      s.peakV = 0;
-      s.intent = false;
-      s.rev = 0;
-    }
+    // 65~600ms 正是「抬手之后马上又滑」的常态，漏掉就是「第二下不跟手」。
+    if (sincePrev >= WHEEL_GESTURE_END_MS) this.clearWheelProgress();
 
     // 触控板捏合 / 旋转是 ctrl+wheel，与横滑互斥：改间距和横移是同一次
     // 物理手势的两种解读，一次只认一种
@@ -945,25 +958,6 @@ export class Gestures {
     }
     if (s.axis !== 'x') return false;
 
-    // 这一段流已经翻过一张了：剩下的（惯性尾巴、用户的余推）只记账、
-    // 不跟随、不结算，直到这一段真的结束（看 wheelGestureRestarted）。
-    if (s.locked) {
-      this.trackWheelReverse(s, dx);
-      if (!this.wheelGestureRestarted(s, sincePrev, now)) {
-        event.preventDefault();
-        return true;
-      }
-      // 上一段结束、这是新的一段 → 从头开始累计。
-      // 轴向与视口宽照抄上一段：手没抬起来，必然还是同一类滑动，让它再从 0
-      // 攒 10px 判一次轴，只会让掉头之后的第一两帧不跟手。
-      const keepW = s.viewW;
-      this.resetWheelSwipe();
-      const fresh = this.wheelSwipe;
-      fresh.at = now;
-      fresh.axis = 'x';
-      fresh.viewW = keepW;
-    }
-
     const t = this.wheelSwipe;
     t.x += dx;
     // 速度与单指同一套平滑（px/ms）。dt 直接取事件间隔，夹在 8~64ms：8ms 是
@@ -988,8 +982,8 @@ export class Gestures {
     event.preventDefault();
 
     // 还在虚按噪点里 → 只记账，画面不动。
-    // 已经接管过切换动画的除外：那时画面正停在两张图中间（基准已经被改成
-    // 「当前停的位置」），每一帧都必须把位置写回去，否则会退回一整档。
+    // 已经接管过切换动画的除外：那时画面正停在两张图中间，每一帧都必须把
+    // 位置写回去，否则会退回一整档。
     if (Math.abs(t.x) <= WHEEL_SWIPE_DEADZONE && t.base === null) {
       this.armWheelSettle();
       return true;
@@ -999,11 +993,10 @@ export class Gestures {
     // 这一帧要写的位移，而它们的当前位置**只能从 computed 里读**（WAAPI 关键帧
     // 优先级高于内联样式，直接 cancel 会让视觉瞬间掉回内联值）：
     //   * 本实例上一次没达标的回弹（`this.anim`）：掐掉它会把那段没走完的位移
-    //     整段丢掉、画面往回跳一下，就是「前一段位移像丢了一样」；
+    //     整段丢掉、画面往回跳一下；
     //   * viewer 的切图收尾动画（跑在同一个 track 上，`this.anim` 够不到它）：
     //     连续切换时用户往往在上一次收尾还没播完就再次起手，那一段跟手位移会
-    //     整段被关键帧吞掉，要等动画结束才突然生效 —— 「连切几张之后就不跟手、
-    //     有延迟」的来源。
+    //     整段被关键帧吞掉。
     // 一段手势只接管一次：接管之后基准已经固化，再滑就纯粹是本段的位移。
     let carried = 0;
     if (this.anim) {
@@ -1015,6 +1008,38 @@ export class Gestures {
       t.base = claimed != null ? claimed : carried;
     }
     const viewW = s.viewW || (s.viewW = this.o.view().w);
+
+    // ---- 连续推进：累计位移每跨过一整屏就同步换一张 --------------------
+    // `t.base + t.x` 是画面相对当前中间槽的显示位置。跨过整屏时调用方把三槽
+    // 轮转一格（rebalance）—— 视觉位置不变，只是视口外那个槽换了内容。把跨
+    // 过去的那一屏从累计里扣掉，余下的位移继续 1:1 跟手，于是惯性尾巴能一路
+    // 推过多张，不会像旧实现那样「翻完一张就锁死、手指还在推画面却停住」。
+    let steps = 0;
+    while (Math.abs(t.base + t.x) >= viewW && steps < WHEEL_ADVANCE_MAX) {
+      steps += 1;
+      const shown = t.base + t.x;
+      const direction = shown < 0 ? 1 : -1; // 手指向左 → 下一张
+      if (!this.o.onWheelAdvance?.(direction)) {
+        // 到首尾：累计不许无限堆（否则反向要先走完这几千 px 才响应），
+        // 夹到一小段阻尼位移 —— 既给出「没了」的手感，也不会把视口外那个
+        // 空槽整屏拉进来。
+        t.x = Math.sign(shown) * WHEEL_OVERSCROLL_RUBBER - t.base;
+        break;
+      }
+      // 换页后轨道基准已被对齐到新的中间槽（`base` 归零），显示位置要减掉刚
+      // 跨过的那一屏：`t.x = (base + x) + direction * viewW`。
+      t.x = shown + direction * viewW;
+      t.base = 0;
+    }
+
+    // 异常增量兜底：单个事件撞到 WHEEL_ADVANCE_MAX 上限时，累计里可能还压着
+    // 十几屏。wheelFollowOffset 会把它衰减成「一屏 + 阻尼」，那一帧的视觉位置
+    // 反而跨到槽位之外（甚至落到反方向）。夹到不足一屏，跟手与结算方向才一致。
+    const rest = t.base + t.x;
+    if (Math.abs(rest) >= viewW) {
+      t.x = Math.sign(rest) * (viewW - 1) - t.base;
+    }
+
     this.swipeX = this.wheelFollowOffset(t.base + t.x, viewW);
     this.applyTrack();
 
@@ -1025,18 +1050,9 @@ export class Gestures {
       this.o.onSwipeIntent?.(t.x < 0 ? 1 : -1);
     }
 
-    // 到点立刻结算，不陪惯性尾巴耗时间。两种「意图已经明确」的情形：
-    //   1. 已经拖过半张图 —— 不可能是误触；
-    //   2. 还是快速划动（当前速度）且行程够了 —— 一次「甩」。
-    // 剩下的（慢慢拖出去一小段就停住）才交给 armWheelSettle 等流结束再判。
-    const far = Math.abs(t.x) >= viewW * WHEEL_COMMIT_RATIO;
-    const fast =
-      Math.abs(t.x) >= WHEEL_FAST_COMMIT_PX && Math.abs(t.vx) > WHEEL_FLICK_VELOCITY;
-    if (far || fast || Math.abs(t.x) >= viewW) {
-      this.settleWheelSwipe();
-      return true;
-    }
-
+    // 结算统一留给「流停下来」那一个窗口。连续推进期间画面全程跟手，提前决定
+    // 结局反而会插进一段收尾动画、把后面还在走的惯性尾巴打断 —— 那正是旧实现
+    // 「连续快滑卡顿、反馈延迟累积」的来源。
     this.armWheelSettle();
     return true;
   }
@@ -1055,7 +1071,12 @@ export class Gestures {
 
   /**
    * 排下一次「结算」：`WHEEL_GESTURE_END_MS` 没有新事件就认为这一段结束了。
-   * 每个新事件都会重排 —— 定时器到点而没有被重置，才说明流真的停了。
+   *
+   * 每个新事件都会重排 —— 定时器到点而没有被重置，才说明流真的停了。这里
+   * **只有这一个刻度**：结算与「新的一段」共用它，刻度分开会留出一段「既没
+   * 结算完、又不许重来」的窗口（历史上正是「怎么滑都不动」）。连续推进期间
+   * 画面全程跟手，等流停下来的这 65ms 只是最后把余数吸附到某一张，不会像旧
+   * 实现那样每翻一张都插一段收尾动画、把延迟一张张攒起来。
    */
   armWheelSettle() {
     clearTimeout(this._wheelSettle);
@@ -1066,16 +1087,19 @@ export class Gestures {
   }
 
   /**
-   * 「松手」那一刻：用与单指**完全相同**的判据决定要不要翻页。
+   * 「流停下来」那一刻：把最后那段不足一屏的余数**吸附到某一张**。
    *
-   *   位移 ≥ 视口宽 `SWIPE_DISTANCE_RATIO`，**或** 速度 ≥ `SWIPE_VELOCITY`
-   *   且累计 ≥ `SWIPE_MIN_PX`。
+   * 整屏的位移已经在 `handleWheelHorizontal` 里按张结清（同步换页），这里只
+   * 处理 `swipeX` 里剩下的余数，判据**沿用单指松手的那一套**（位移 ≥ 视口宽
+   * `SWIPE_DISTANCE_RATIO`，或峰值速度 ≥ `SWIPE_VELOCITY` 且余数 ≥
+   * `SWIPE_MIN_PX`）—— 慢拖一张、轻甩一张的手感因此一点没变：
+   *   * 命中 → 补完到下一张，从当前跟手位置接着播（`fromSwipe`），与单指 /
+   *     键盘 / 按钮同一条收尾；
+   *   * 否则 → 回弹到当前张。
    *
-   * 速度取这一段里的**峰值**而不是末值：这一串末尾的事件是惯性尾巴最后几帧
-   * 的微弱样本（单指那边则是手指离屏前真实的那一帧），拿末值会几乎永远不达标。
-   *
-   * 与其它入口一样从当前跟手位置接着播（`fromSwipe`），所以不存在「先跳回去
-   * 再滑出来」的那一帧。判定不通过则回弹归位。
+   * 速度取本段**峰值**而不是末值：末尾那几个惯性事件的样本太微弱，拿末值会
+   * 几乎永远不达标。结算完只清「本段」的累计与接管偏移，**不落锁** —— 下一段
+   * 流由 `handleWheelHorizontal` 的静默判据重新开始累计。
    *
    * @param {number} waited 已经因为「动画还在跑」重试了多久（ms）
    */
@@ -1084,9 +1108,7 @@ export class Gestures {
     this._wheelSettle = 0;
 
     const s = this.wheelSwipe;
-    if (s.locked) return;
-
-    const dx = s.x;
+    const dx = this.swipeX;
     const direction = dx < 0 ? 1 : -1; // 手指向左 → 下一张
     // 宽度优先用这一段缓存的那一份：这里通常在定时器回调里，若不是同一段手势
     // （已 reset）才需要重新量一次
@@ -1095,7 +1117,7 @@ export class Gestures {
     const fast = Math.abs(dx) > SWIPE_MIN_PX && s.peakV > SWIPE_VELOCITY;
 
     if ((far || fast) && this.o.canSwipe?.(direction)) {
-      // 切换 / 展开动画还没跑完：等它一下，别把这一次手势白白丢掉
+      // 切换 / 展开动画还没跑完：等它一下，别把这一次吸附白白丢掉
       if (!this.enabled && waited < WHEEL_SETTLE_MAX_MS) {
         this._wheelSettle = setTimeout(
           () => {
@@ -1107,22 +1129,19 @@ export class Gestures {
         return;
       }
       if (this.enabled) {
-        this.lockWheelSwipe(performance.now(), direction);
+        this.clearWheelProgress();
         this.o.onWheelSwipe?.(direction, { fromSwipe: true });
+        this.o.onWheelRest?.();
         return;
       }
     }
     this.reboundWheelSwipe();
+    this.o.onWheelRest?.();
   }
 
   /** 没达标的这一段：轨道带着当前跟手位置回弹到 0 */
   reboundWheelSwipe() {
-    this.wheelSwipe.locked = false;
-    this.wheelSwipe.x = 0;
-    // 回弹的**终点**才是 0；回弹被打断时画面并不在 0。把 base 交回 null，
-    // 下一段跟手就会去读实际的视觉位置接着走 —— 写死成 0 的话，用户回弹还没
-    // 播完就再滑一次，那一段没走完的位移会被整段丢掉、画面往回跳。
-    this.wheelSwipe.base = null;
+    this.clearWheelProgress();
     // 200ms：回弹的距离通常只有几十 px，原来那 280ms 会显得「松手之后还黏着」
     this.animateTrackTo(0, 200, EASE_SOFT);
   }
@@ -1146,65 +1165,24 @@ export class Gestures {
   }
 
   /**
-   * 进入「这一串已经翻过一张」的状态：后续增量只记账、不再触发。
+   * 清掉「这一段流」的累计与接管偏移，**但保留轴向与视口宽**。
    *
-   * 累积位移也要一起清零，否则下一次解锁时残留的旧位移会被算进新手势 ——
-   * 「触发后没重置基准、累积量越过阈值又翻一张」就是这么来的。
+   * 新的一段（静默 ≥ `WHEEL_GESTURE_END_MS`）和结算完成时都走这里。轴向留着
+   * 是因为手还是同一类滑动，没必要再攒 10px 判一次轴；`base` 必须交回 null：
+   * 回弹 / 收尾动画的**终点**才是 0，被打断时画面并不在 0，写死成 0 会让下
+   * 一段跟手把没走完的那截位移整段丢掉、画面往回跳。
+   *
+   * 注意这里**没有**「锁定」：连续流按累计位移推进，翻过几张由行程决定，不靠
+   * 一个闸门去挡后续事件 —— 旧的 `locked` + `wheelGestureRestarted` 正是「翻完
+   * 一张之后画面停住、惯性尾巴被吞掉」的根因。
    */
-  lockWheelSwipe(now, direction) {
+  clearWheelProgress() {
     const s = this.wheelSwipe;
     s.x = 0;
-    s.rev = 0;
-    // 基准也一起作废：这一格翻完之后轨道会重新落位，下一段手势要重新接管
-    // （否则接管的偏移会被当成新一段的位移，一松手就多翻一张）
     s.base = null;
-    s.locked = true;
-    s.lockedAt = now;
-    s.dir = direction;
-  }
-
-  /**
-   * 锁定期间累积「反向重推」的行程。
-   *
-   * 符号约定容易看错：`s.dir` 记的是「翻到了哪一边」（+1 = 下一张），而 `dx`
-   * 是屏幕坐标系下的位移（向左为负），触发那一刻满足 `dir = -sign(dx)`。
-   * 所以「和用户刚才那一推反着来」 ⇔ `sign(dx) === sign(s.dir)`。
-   * 同手推的事件会把累积清零 —— 抖动因此攒不出阈值，而「没抬手直接往回滑」
-   * 攒得出来，那是一次货真价实的新滑动。
-   */
-  trackWheelReverse(s, dx) {
-    const reverse =
-      s.dir !== 0 && dx !== 0 && Math.sign(dx) === Math.sign(s.dir);
-    if (!reverse) {
-      s.rev = 0;
-      return;
-    }
-    s.rev += Math.abs(dx);
-  }
-
-  /**
-   * 这一段 wheel 流是否已经结束 —— 也就是「可以再翻一张了吗」。
-   *
-   * 结算与解锁用的是**同一个刻度** `WHEEL_GESTURE_END_MS`：正因为流停了这么久
-   * 才判定翻页（定时器到点），所以下一次事件间隔超过它就必然是新手势。刻度分开
-   * 会留出一段「既没结算完、又不许重来」的窗口，表现就是「怎么滑都不动」。
-   *
-   * 三条出口，前一条不成立才看下一条：
-   *   1. 反向行程攒够 `WHEEL_REVERSE_TRAVEL` —— 惯性流不会自己掉头，掉头且攒够
-   *      一段行程说明用户压根没抬手只是换了方向，那是一次新的滑动；
-   *   2. 静默 ≥ `WHEEL_GESTURE_END_MS` —— 上一段确实停了，这是新的一推；
-   *   3. 硬上限 `WHEEL_LOCK_MAX_MS`：兜底，异常长的尾巴不能把用户永久锁住。
-   *
-   * 这里**没有**任何「单次增量达到峰值某个比例」之类的判据：一次持续推力里每帧
-   * 增量本来就在峰值附近，那种判据会在手指还按着的时候就把锁解掉；同时也**不设**
-   * 「必须锁满切换动画时长」这条硬下限 —— 那是上一版为了挡连翻加的，代价是把
-   * 抬手之后再滑的第二段也一起吞了；现在动画还没跑完的情况交给
-   * `settleWheelSwipe` 的重试去等，不需要提前猜时间。
-   */
-  wheelGestureRestarted(s, sincePrev, now) {
-    if (s.rev >= WHEEL_REVERSE_TRAVEL) return true;
-    if (sincePrev >= WHEEL_GESTURE_END_MS) return true;
-    return now - s.lockedAt > WHEEL_LOCK_MAX_MS;
+    s.vx = 0;
+    s.peakV = 0;
+    s.intent = false;
   }
 
   /**
@@ -1282,11 +1260,12 @@ function panBoundsOf(view, base, scale) {
 }
 
 /**
- * 一次横向 wheel 手势的初始状态。
+ * 一段横向 wheel 流的初始状态。
  *
- * `locked` 是「已经翻过一张」的意思 —— 它和时间无关，生命的终点是**这一串
- * wheel 真的结束了**，而不是一个固定倒计时：触控板抬手后的惯性尾巴能持续
- * 一秒以上，靠倒计时挡不住，必须在尾巴停息后才解锁。
+ * `x` 是**连续位置**而不是「离阈值还差多少」：整屏的位移在
+ * `handleWheelHorizontal` 里被一张张同步结清，剩下的始终是不足一屏的余数，
+ * 流结束时由 `settleWheelSwipe` 吸附。没有锁、没有冷却 —— 生命的终点就是
+ * 这一串 wheel 真的停下来（静默 `WHEEL_GESTURE_END_MS`）。
  */
 function freshWheelSwipe() {
   return {
@@ -1294,7 +1273,7 @@ function freshWheelSwipe() {
     /** 判定轴向之前的两轴**累积**和（见 WHEEL_AXIS_LOCK_PX） */
     ax: 0,
     ay: 0,
-    /** 这一段里累积的手势位移（px，向左为负） */
+    /** 这一段里累计的手势位移（px，向左为负；跨过整屏后扣掉一屏继续） */
     x: 0,
     /**
      * 接管切换动画时「画面已经停在哪儿」的偏移（px，相对中间槽基准）。
@@ -1317,19 +1296,9 @@ function freshWheelSwipe() {
     intent: false,
     /** 上一个事件的时间戳：既用于判「换了手势」，也用于算速度 */
     at: 0,
-    /** 平滑后的速度（px/ms）与这一段里的峰值速度 */
+    /** 平滑后的速度（px/ms）与这一段里的峰值速度（流结束吸附用） */
     vx: 0,
-    peakV: 0,
-    /**
-     * 锁定之后累积的**反向行程**。
-     * 只有攒够 `WHEEL_REVERSE_TRAVEL` 才说明用户真的换了个方向重推，
-     * 单帧的反向抖动会被后面同向的事件清零，不算数。
-     */
-    rev: 0,
-    locked: false,
-    lockedAt: 0,
-    /** 触发时的方向，用于识别反向重推 */
-    dir: 0
+    peakV: 0
   };
 }
 

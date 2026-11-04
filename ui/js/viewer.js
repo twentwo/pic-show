@@ -26,6 +26,7 @@ import {
   thumbUrl,
   maxEdgeFor,
   preload,
+  takeDecoded,
   revealImage
 } from './api.js';
 import { fitBox, clamp, mapBoxToRect } from './geometry.js';
@@ -135,6 +136,22 @@ const SWITCH_MS = 300;
  * 留 110ms 下限，剩余距离为 0 时也不会变成瞬移。
  */
 const SWITCH_EXIT_MIN_MS = 110;
+/**
+ * 连续横滑时沿滑动方向预热的张数。
+ *
+ * 一次快速甩动能一口气跨过好几张，而 `preloadNeighbors()` 是切完才排的、只
+ * 预热前后各一张，跟不上连续推进。取 4 是因为轮转出去的那个槽要走过两屏
+ * 才会重新进入视口 —— 至少给它留两屏的提前量，且缩略图与原图都要备齐：
+ * `fill()` 真正画的是缩略图，只预热原图等于预热错了资源。
+ */
+const PREFETCH_RUN = 4;
+/**
+ * wheel 流结束吸附那一小段收尾的最长时长。
+ *
+ * 整段流里画面都是 1:1 跟着手指走的，最后只补「不足一屏的余数」。若还按
+ * 键盘切图的 300ms 播，节奏会在松手那一下突然慢下来，就是「顿挫」。
+ */
+const WHEEL_LAND_MS = 180;
 /** 跳转到相隔很远的一张时用的淡入时长 */
 const JUMP_MS = 200;
 /** 到首尾回弹提示的幅度（px） */
@@ -830,11 +847,73 @@ export class Viewer {
    * ------------------------------------------------------------------ */
 
   /**
+   * 连续横滑：累计位移跨过一整屏时的**同步换页**。
+   *
+   * 与 `go()` 的区别是这里什么都不等：不播收尾动画、不设 `switching` 闸门、
+   * 不关 `enabled`、不重建 `Gestures`（只把变换目标 `retarget` 到新的当前槽）。
+   * 这一段 wheel 流还在跑，任何一次「等动画 / 重建监听器 / 落锁」都会把下一段
+   * 跟手位移吞掉 —— 连续快滑的卡顿与反馈延迟累积正是这么来的。
+   *
+   * 视觉连续性由 `rebalance()` 保证：DOM 轮转一格的同时把 `trackOffset` 对齐到
+   * 新的中间槽，此刻画面正好停在「下一张完整显示」的位置；手势随后写回
+   * `trackOffset + swipeX`（`swipeX` 已扣掉刚跨过的那一屏），一帧都不差。
+   *
+   * 原图**不在这里拉**：连续快滑一帧能跨过好几张，逐张取原图只会让解码挤满
+   * 主线程。槽里已有的低分辨率底图（与网格同一 URL，命中缓存）先顶着，流结束
+   * 时由 `onWheelRest` 补给最终那一张 —— 这也是「供给不及即降级」的落点。
+   *
+   * @param {number} direction +1 下一张 / -1 上一张
+   * @returns {boolean} false = 到首尾了，调用方改走阻尼
+   */
+  advanceBy(direction) {
+    const step = direction > 0 ? 1 : -1;
+    if (!this.isOpen || this.closing) return false;
+    const target = this.index + step;
+    if (target < 0 || target >= this.items.length) return false;
+
+    // 作废任何还在跑的切换 / 收尾动画及其世代号：连续流不欠它一次 await
+    if (this.trackAnim) {
+      try {
+        this.trackAnim.cancel();
+      } catch {
+        /* 已结束的动画忽略 */
+      }
+      this.trackAnim = null;
+    }
+    this.switchGen += 1;
+    this.switching = false;
+
+    // 连续推进的热路径：视口只量一次，往下传给 rebalance / fill，别在
+    // appendChild 之后、写完 transform 之前再读 clientWidth（强制同步重排）。
+    const view = this.view();
+    this.index = target;
+    this.slotIndex = 1 + step;
+    this.box = this.slots[this.slotIndex].__box ?? this.box;
+    // 轮转三槽：当前张回到中间，视口外那个槽换上「再下一张」的内容。
+    // skipTransform：紧跟其后的 applyTrack() 会在同一任务里写回「基准 + 剩余
+    // 位移」，这里再写一次静止基准纯属多余（同一帧第二次 transform 写入）。
+    this.rebalance({ view, skipTransform: true });
+    // 手势实例不重建，只把变换目标换到新的当前槽
+    this.g?.retarget(this.currentSlot);
+
+    this.updateInfo();
+    this.strip.focus(target);
+    this.bumpChrome();
+    // 沿滑动方向连续预热，别等结算帧才撞上解码
+    this.prefetchNeighbor(step, PREFETCH_RUN);
+    return true;
+  }
+
+  /**
    * @param {number} delta +1 下一张 / -1 上一张
    * @param {object} [opts]
    * @param {boolean} [opts.fromSwipe] 由手指横滑触发 —— 从手指当前位置接着播
+   * @param {boolean} [opts.fromWheel] 由触控板 wheel 流结束吸附触发。整段流用的是
+   *   **同一个** Gestures 实例（轴向 / 累计 / 结算定时器都挂在它身上），重建实例
+   *   会拆掉监听器、把关掉的 enabled 留到动画结束 —— 紧跟着的下一段横滑要么被吞、
+   *   要么等重试，就是「松手之后发木」。这条路径只 retarget、不碰闸门。
    */
-  async go(delta, { fromSwipe = false } = {}) {
+  async go(delta, { fromSwipe = false, fromWheel = false } = {}) {
     const step = delta > 0 ? 1 : -1;
     if (!this.isOpen || this.switching || this.closing) return;
 
@@ -878,17 +957,27 @@ export class Viewer {
 
     this.updateInfo();
     this.strip.focus(target);
-    this.attachGestures();
-    if (this.g) this.g.enabled = false;
+    if (fromWheel) {
+      // 不重建手势、不关 enabled：同一个实例接着处理紧随其后的下一段 wheel。
+      // 只把变换目标换到新的当前槽（那一格稍后由 rebalance 轮到中间）。
+      this.g?.retarget(this.currentSlot);
+    } else {
+      this.attachGestures();
+      if (this.g) this.g.enabled = false;
+    }
     this.bumpChrome();
 
     // 收尾动画只补完剩下的那段距离 —— 跟手已经推掉大半时，固定 300ms 会让
     // 「手指早就到那儿了、画面还在慢慢挪」的拖沓感非常明显。
     // 键盘 / 按钮（carried = 0）的剩余距离恒为一屏，因此仍是完整的 SWITCH_MS。
+    // wheel 流整段都是 1:1 跟手，最后只补不足一屏的余数：固定用 WHEEL_LAND_MS，
+    // 不再按 SWITCH_MS 缩放（那样会把最后一下拖成键盘切图的节奏，就是「顿挫」）。
     const dist = Math.abs(toX - fromX);
-    const duration = fromSwipe
-      ? clamp((SWITCH_MS * dist) / Math.max(1, width), SWITCH_EXIT_MIN_MS, SWITCH_MS)
-      : SWITCH_MS;
+    const duration = fromWheel
+      ? WHEEL_LAND_MS
+      : fromSwipe
+        ? clamp((SWITCH_MS * dist) / Math.max(1, width), SWITCH_EXIT_MIN_MS, SWITCH_MS)
+        : SWITCH_MS;
 
     await this.animateTrack(fromX, toX, duration);
     // 这一格已经被手势接管（`claimTrack` 就地落位并把 switching 放回 false），
@@ -897,7 +986,7 @@ export class Viewer {
     // DOM 轮转一格 + 基准偏移同步改回中间槽 —— 两者同一帧生效，画面不动
     this.rebalance();
     this.preloadNeighbors();
-    if (this.g) this.g.enabled = true;
+    if (!fromWheel && this.g) this.g.enabled = true;
     this.switching = false;
   }
 
@@ -990,51 +1079,88 @@ export class Viewer {
     return visual - this.trackOffset;
   }
 
-  /** 轨道位移：先把终值写进 inline style，动画 fill:'none'，收尾不闪回 */
+  /**
+   * 轨道位移：**起点**先落地，动画 `fill:'forwards'`，终点在 finished 里提交。
+   *
+   * 以前是把**终点**写进 inline style、动画 `fill:'none'` 靠关键帧盖住起点：
+   * 为了保证「收尾不闪回」，代价是 WAAPI 关键帧要等下一帧才采样，中间那一帧
+   * 显示的是 inline 的终点 —— 于是每次收尾都先「闪到终点、再弹回起点」，
+   * 正是「顿挫 / 跳变 / 闪烁」。改成起点落地之后，起点帧与终点帧都不跳；
+   * `forwards` 让动画期间由关键帧接管，跑完把终值提交到 inline 再 cancel，
+   * 收尾同样不闪回。
+   *
+   * 被 `claimTrack()` 取消时它已经把轨道落到新基准、并把 `trackAnim` 清空，
+   * 所以这里只在「仍是我这一次」时才提交终值 —— 否则会把刚接管的画面又拽回
+   * 终点，那是一次位置跳变。
+   */
   animateTrack(fromX, toX, duration, easing = EASE) {
     const from = `translate3d(${fromX}px, 0, 0)`;
     const to = `translate3d(${toX}px, 0, 0)`;
 
     this.trackOffset = toX;
-    this.track.style.transform = to;
+    this.track.style.transform = from;
 
-    if (duration <= 0 || from === to) return Promise.resolve();
+    if (duration <= 0 || from === to) {
+      this.track.style.transform = to;
+      return Promise.resolve();
+    }
 
     const anim = this.track.animate(
       { transform: [from, to] },
-      { duration, easing, fill: 'none' }
+      { duration, easing, fill: 'forwards' }
     );
     this.trackAnim = anim;
     return anim.finished
       .then(() => {
+        if (this.trackAnim !== anim) return;
+        this.track.style.transform = to;
+        try {
+          anim.cancel();
+        } catch {
+          /* 已结束的动画忽略 */
+        }
         this.trackAnim = null;
       })
-      .catch(() => {});
+      .catch(() => {
+        if (this.trackAnim === anim) this.trackAnim = null;
+      });
   }
 
   /**
    * 轮转 DOM 顺序，让当前槽回到中间。
    * 关键：只有被挪到视口外的那个槽需要换内容，正在看的那张纹丝不动。
+   *
+   * @param {object} [opts]
+   * @param {?object} [opts.view] 调用方量好的视口。连续推进时传入，可避开
+   *   「appendChild / insertBefore 改了 DOM 结构 → 再读 clientWidth」的强制重排。
+   * @param {boolean} [opts.skipTransform] 为 true 时不写静止基准那条 transform。
+   *   连续推进专用：紧跟着的 `Gestures.applyTrack()` 会在同一任务里写回
+   *   「基准 + 剩余位移」，两条写入之间不会渲染，中间这条纯属多余。
    */
-  rebalance() {
+  rebalance({ view = null, skipTransform = false } = {}) {
     if (this.slotIndex === 1) return;
 
+    // 一次量好：下面要改 DOM 结构（会脏布局），之后再读 clientWidth 就是一次
+    // 同步重排。连续推进时 view 由 advanceBy 传入，这里完全不碰布局。
+    const v = view ?? this.view();
     const [a, b, c] = this.slots;
     if (this.slotIndex === 2) {
       // [a,b,c] → [b,c,a]：a 挪到末尾，改填「新的下一张」
       this.track.appendChild(a);
       this.slots = [b, c, a];
-      this.fill(a, this.index + 1);
+      this.fill(a, this.index + 1, v);
     } else {
       // [a,b,c] → [c,a,b]：c 挪到最前，改填「新的上一张」
       this.track.insertBefore(c, a);
       this.slots = [c, a, b];
-      this.fill(c, this.index - 1);
+      this.fill(c, this.index - 1, v);
     }
 
     this.slotIndex = 1;
-    this.trackOffset = -this.slotWidth();
-    this.track.style.transform = `translate3d(${this.trackOffset}px, 0, 0)`;
+    this.trackOffset = -v.w;
+    if (!skipTransform) {
+      this.track.style.transform = `translate3d(${this.trackOffset}px, 0, 0)`;
+    }
   }
 
   /** 到首尾时给一下回弹，告诉用户「没有了」 */
@@ -1100,9 +1226,18 @@ export class Viewer {
 
   /**
    * 把某张图装进某个槽。
-   * 只设低分辨率底图（与网格同一个 URL，命中缓存）；原图等它成为当前项再拉。
+   *
+   * 连续横滑时这个槽会在**一两屏之后**就滚进视口，所以「换内容」不能等它
+   * 露出来才现取：优先把预取阶段已经 `decode()` 好的 <img> 直接换进来（同一
+   * 帧就有像素），池里没有才退回设 src（字节也已在内存缓存里，只是多一次
+   * 绘制）。原图同理 —— 预热过就直接给清晰的，不要每次轮转都掉回模糊底图，
+   * 那种清晰度跳变在快滑里看起来就是「闪」。
+   *
+   * @param {?object} view 由调用方量好的视口；连续推进时一次量好往下传，
+   *   免得每个槽都读一次 clientWidth（前面刚改过 DOM 顺序、又写过 transform，
+   *   那就是强制重排）。空槽直接返回，连这一次都不量。
    */
-  fill(slot, itemIndex) {
+  fill(slot, itemIndex, view = null) {
     if (!slot) return;
     // 越界统一记成 -1，槽位状态只有「装着第几张」和「空」两种
     const at = itemIndex >= 0 && itemIndex < this.items.length ? itemIndex : -1;
@@ -1112,6 +1247,8 @@ export class Viewer {
     slot.classList.remove('is-full', 'is-failed', 'is-low-failed', 'is-zoomed', 'is-grabbing');
     slot.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
     slot.style.removeProperty('opacity');
+    // 上一次可能换进来一张带着 inline opacity:1 的已解码原图，先清掉
+    slot.__full.style.removeProperty('opacity');
 
     const item = at >= 0 ? this.items[at] : null;
     if (!item) {
@@ -1123,11 +1260,60 @@ export class Viewer {
       return;
     }
 
-    this.refitSlot(slot, item, this.view());
-    slot.__full.alt = item.name ?? '';
+    // 按需才量：连续推进时由 advanceBy 量好一次传下来。
+    const v = view ?? this.view();
+    this.refitSlot(slot, item, v);
 
-    setSrc(slot.__low, thumbUrl(item.id));
-    setSrc(slot.__full, '');
+    const lowUrl = thumbUrl(item.id);
+    if (!this.adoptSlotImage(slot, '__low', lowUrl, 'slide-low')) {
+      setSrc(slot.__low, lowUrl);
+    }
+
+    const fullSrc = fullUrl(item.id, maxEdgeFor(item));
+    if (this.adoptSlotImage(slot, '__full', fullSrc, 'slide-full')) {
+      // 已解码 → 直接定格，别让 CSS 的 0.32s 淡入在连续横滑里变成一张张淡出来
+      slot.__full.style.opacity = '1';
+      slot.classList.add('is-full');
+    } else {
+      setSrc(slot.__full, '');
+    }
+    slot.__full.alt = item.name ?? '';
+  }
+
+  /**
+   * 把预取池里**已解码**的 <img> 直接替换进槽。
+   * @returns {boolean} false = 池里没有，调用方退回 setSrc
+   */
+  adoptSlotImage(slot, key, url, className) {
+    const old = slot[key];
+    // 先确认槽里的节点还挂在 DOM 上，再去池里取：takeDecoded 是「取走即出池」，
+    // 若这一步失败而 ready 已经被拿走，那张预热好的节点就白白丢了，调用方
+    // 只能退回 setSrc 重新解码。
+    if (!old?.parentNode) return false;
+    const ready = takeDecoded(url);
+    if (!ready) return false;
+
+    ready.className = className;
+    ready.decoding = 'async';
+    ready.draggable = false;
+    ready.alt = '';
+    ready.__want = url;
+    if (key === '__low') {
+      ready.addEventListener('error', () => {
+        if (isRealFailure(ready)) slot.classList.add('is-low-failed');
+      });
+    } else {
+      ready.addEventListener('load', () => {
+        slot.classList.add('is-full');
+        slot.classList.remove('is-failed');
+      });
+      ready.addEventListener('error', () => {
+        if (isRealFailure(ready)) slot.classList.add('is-failed');
+      });
+    }
+    old.replaceWith(ready);
+    slot[key] = ready;
+    return true;
   }
 
   /**
@@ -1217,8 +1403,9 @@ export class Viewer {
       // 收尾动画归 viewer 管，手势够不到它的句柄 —— 交给它「就地结束并接上」
       claimTrack: () => this.claimTrack(),
       // 每次切换都会重建 Gestures，但「一次触控板横滑」是跨实例连续的物理
-      // 手势 —— 累积与冷却必须交接过去，否则实例一换就重新累积，一次甩动会
-      // 因为一路达标而连翻好几张
+      // 手势 —— 轴向、视口宽与本段累计必须交接过去，否则实例一换就重新攒
+      // 10px 判一次轴，起手又要慢半拍。连续推进本身不重建实例（见 advanceBy），
+      // 这里只服务流结束吸附那一次 go()。
       wheelState: previous?.wheelSwipe,
       base: () => this.box,
       view: () => this.view(),
@@ -1250,11 +1437,19 @@ export class Viewer {
       onSwipeRelease: (direction) => {
         this.go(direction, { fromSwipe: true });
       },
-      // 触控板双指横滑：手势期间画面一直跟着手走（横向那条分支写 `swipeX`），
-      // 停下来的那一刻才到这里结算 —— 于是它与单指松手走同一条 `fromSwipe`
-      // 路径，从当前跟手位置接着把剩下的位移播完。
+      // 连续横滑：累计位移每跨过一整屏就同步换一张（不播动画、不重建手势）。
+      // 返回 false 表示到首尾，手势自己改走阻尼。
+      onWheelAdvance: (direction) => this.advanceBy(direction),
+      // 流结束吸附：补完最后一张时与单指松手共用 `fromSwipe`（从当前跟手位置
+      // 接着把剩下的位移播完），但额外标 `fromWheel` —— 走不重建手势、不落闸、
+      // 固定 WHEEL_LAND_MS 的那条轻量收尾。
       onWheelSwipe: (direction, opts = {}) => {
-        this.go(direction, { fromSwipe: true, ...opts });
+        this.go(direction, { fromSwipe: true, fromWheel: true, ...opts });
+      },
+      // 一段流结算完：连续推进期间只让底图顶着，这时才补给最终那一张的原图
+      onWheelRest: () => {
+        this.startFullLoad();
+        this.preloadNeighbors();
       },
       // 跟手一开始就把目标那张的原图取回来解码：切过去的第一帧不必等解码
       onSwipeIntent: (direction) => this.prefetchNeighbor(direction),
@@ -1296,16 +1491,26 @@ export class Viewer {
   }
 
   /**
-   * 横滑方向一确定就把目标那张的原图取回来（并解码）。
+   * 横滑方向一确定就把目标那张（以及沿方向的后续几张）取回来解码。
    *
-   * `preloadNeighbors()` 是每次切完之后才排的；打开预览后立刻甩一下时，目标那张
-   * 可能还在路上，结算那帧刚好撞上解码，观感是「切过去先糊一下」。跟手阶段
-   * 主线程本来就是空的，这时提前取最划算。
+   * `preloadNeighbors()` 是每次切完之后才排的、只备前后各一张；打开预览后立刻
+   * 甩一下时，目标那张可能还在路上，结算那帧刚好撞上解码。跟手阶段主线程
+   * 本来就是空的，这时提前取最划算。连续推进会一次跨过好几张，`count` 因此
+   * 由 `advanceBy` 扩到 `PREFETCH_RUN`，让供给跟着滚动方向走。
+   *
+   * **缩略图必须一起预热**：`fill()` 往槽里画的是 `thumbUrl()`，只预热原图
+   * 的话，轮转进来的那个槽仍要现取一次，一两屏之后就露出空白 —— 连续快滑里
+   * 「邻图没跟着移入」正是这一帧。`preload()` 按 URL 去重，两份一起备不会
+   * 把同一张图解码两遍。
    */
-  prefetchNeighbor(direction) {
-    const item = this.items[this.index + direction];
-    if (!item) return;
-    preload(fullUrl(item.id, maxEdgeFor(item)), 'high');
+  prefetchNeighbor(direction, count = PREFETCH_RUN) {
+    const step = direction > 0 ? 1 : -1;
+    for (let n = 1; n <= count; n += 1) {
+      const item = this.items[this.index + step * n];
+      if (!item) break;
+      preload(thumbUrl(item.id), 'high');
+      preload(fullUrl(item.id, maxEdgeFor(item)), 'high');
+    }
   }
 
   /**

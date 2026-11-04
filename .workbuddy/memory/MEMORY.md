@@ -88,3 +88,54 @@ LaunchServices 唤起时系统切到「包含该应用窗口的桌面」，冷�
    复用；来源应用找不到才回退访达；连访达都找不到就什么都不做。
 5. `exit_app` 顺序：先销毁全屏窗口 → 再交还前台 → 留 140ms 给异步激活落地 →
    才 `app.exit(0)`。由 `tools/check_boot.mjs` 的多桌面断言组钉住。
+
+## 触控板横滑：一条连续滚动流，不是「一次手势一张」
+
+**别再把「一段连续 wheel 流最多结算一次、甩得再远也只翻一张」当成纪律写回来。**
+那是旧契约，正是「连续快滑卡顿 / 画面不跟手 / 反馈延迟累积」的根因，已按产品目标
+改成语义级连续模型（`gestures.js` / `viewer.js` / 三个回归契约同步改写）：
+
+1. `t.x` 是**连续位置**；累计跨过一整屏就 `onWheelAdvance` → `viewer.advanceBy()`
+   同步轮转三槽并扣掉一屏，惯性尾巴能一路推过多张。跨张数由总行程决定。
+2. `advanceBy()` **不播收尾动画、不设 `switching`、不重建 `Gestures`**（只
+   `retarget()`）；流中间绝不插 `go()`。整段流只有流停下时的一次吸附/回弹。
+3. 「一次按下→抬起最多一张」只适用于**单指拖拽**（`swipeFired`）；wheel 流结束
+   吸附只是沿用同一套判据处理「不足一屏的余数」。
+4. 语义改动必须同时改 `check_wheel_swipe.mjs`（时序）、`check_trackpad.mjs`
+   （结构 + 旧锁定不得回归）、`ui/probe.html` 第 17 节、README 设计章节，
+   否则「代码对了、检查器红」。`api.js::preload()` 按 URL 去重是多张预热的必要
+   配套：相邻推进的预热窗口重叠，不去重会把同一张原图反复解码在跟手阶段。
+5. Web wheel 不暴露系统 `phase` / `momentumPhase`，流结束只能用静默
+   `WHEEL_GESTURE_END_MS`（65ms）推断 —— 这是与原生体验最本质的能力差，
+   真机惯性手感只能人工验收，不要靠调阈值假装解决。
+
+## 触控板横滑动画：起点落地、无缝换源、一次量视口
+
+「邻图按手势位移平滑跟随且始终无缝排列、达标自然落位、取消平滑回弹、全程不闪
+不跳」的实现约束，由 `tools/check_trackpad.mjs` 第 11 组钉住，违反即检查失败。
+
+1. **WAAPI 提交纪律**：`viewer.animateTrack()` 与 `Gestures.animateTrackTo()`
+   必须**起点先写进 inline style** + `fill:'forwards'` + 终值只在 `finished`
+   回调里提交回 inline 再 `cancel()`，且提交前认 `this.trackAnim === anim` /
+   `this.anim === anim`。旧写法「终点预写 inline + `fill:'none'`」会让关键帧采样
+   前那一帧显示终点（先闪到终点再弹回起点）、跑完又闪回起点 —— 顿挫 / 跳变 /
+   闪烁全在这一帧。`gestures.animateTo()` 是**另一套**（当前 slide 的缩放/平移，
+   无接管问题），仍是终值预写 + `none`，别把两者统一。
+2. **`fromWheel` 轻量收尾**：wheel 流结束吸附走 `go({ fromWheel: true })`，
+   **不重建 `Gestures`、不关 `enabled`、不落闸**，只 `retarget()`；收尾固定
+   `WHEEL_LAND_MS`(180) 而非键盘 `SWITCH_MS`(300)。重建实例会拆监听器、把动画
+   闸门留到收尾结束，紧跟着的下一段横滑就是「松手之后发木」。
+3. **邻槽无缝换源**：`fill()` 画的是 `thumbUrl()`，预热必须缩略图与原图一起备；
+   `api.js::takeDecoded()` 把已 `decode()` 的 `<img>` 节点直接换进 DOM
+   （`adoptSlotImage()` 先确认 `old.parentNode` 再取池），不走「设 src → 请求 →
+   解码」，否则轮转进视口那一两帧露空白。别提前 `takeDecoded`：取走即出池，
+   失败会白白丢掉预热好的节点。
+4. **热路径不碰布局**：`advanceBy()` 一次 `view()` 往下传给
+   `rebalance({ view, skipTransform: true })` 与 `fill()`；`skipTransform` 跳过
+   同一帧的第二次 transform 写入。`fill()` 默认参数别写 `this.view()` ——
+   `check_methods.mjs` 的 `RE_DEFINED` 用 `[^)]*`，内嵌 `)` 会让方法「查无定义」。
+5. **异常增量夹取**：推进循环后把 `t.base + t.x` 夹到不足一屏（`viewW - 1`），
+   撞到 `WHEEL_ADVANCE_MAX` 上限时剩余十几屏会被 `wheelFollowOffset()` 压到
+   槽位外、甚至落到反方向。
+6. 检查器 / 探针 / README 必须与产品代码同批同步；反向验证要能捕获「起点落地
+   改回终点预写 / forwards 改回 none / 摘掉 fromWheel / 预热改回单张」。
