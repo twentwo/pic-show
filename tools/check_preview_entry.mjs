@@ -363,6 +363,65 @@ ok(
   /\{ duration: OPEN_MS, easing: OPEN_EASE, fill: 'backwards' \}/.test(viewer)
 );
 
+/* ---------------- 7. 每次操作都要真的画着当前图 ---------------- */
+
+console.log('画面显示');
+
+// 「预览失败 / 切过去一片空白」不是加载问题，而是 WAAPI 的提交纪律：
+// jumpTo() 曾把 opacity:0 写进 inline，却用 fill:'none' 播淡入且从不提交
+// 终值 —— 动画一结束元素就回到 inline 的 0，当前槽永久全透明。后续 go()
+// 的 rebalance() 只填轮转出去的那个槽，这个 0 会一直残留到下一次 fill()，
+// 于是切换 / 连续切换张张空白。真 DOM 的行为验证在 ui/probe.html 第 21 节。
+const jumpBody = viewerCode.slice(
+  viewerCode.indexOf('async jumpTo(index)'),
+  viewerCode.indexOf('claimTrack()')
+);
+ok(
+  'jumpTo 淡入用 fill:forwards，并只在 finished（含超时兜底）提交终值再 cancel',
+  /const fade = slide\.animate\(/.test(jumpBody) &&
+    /fill: 'forwards'/.test(jumpBody) &&
+    /withTimeout\(fade\.finished\.catch\(\(\) => \{\}\), JUMP_MS \+ ANIM_SLACK_MS\)/.test(jumpBody) &&
+    /slide\.style\.removeProperty\('opacity'\);/.test(jumpBody) &&
+    /fade\.cancel\(\);/.test(jumpBody) &&
+    !/fill: 'none'/.test(jumpBody),
+  `jumpBody=${jumpBody.length}`
+);
+
+const fillBody = viewerCode.slice(
+  viewerCode.indexOf('fill(slot, itemIndex, view = null)'),
+  viewerCode.indexOf('swapSlotImage(slot, key, url, className)')
+);
+ok(
+  'fill 的可见性兜底排在「内容没变提前返回」之前（提前返回也不能留透明槽）',
+  /slot\.style\.removeProperty\('opacity'\);/.test(fillBody) &&
+    fillBody.indexOf("slot.style.removeProperty('opacity');") <
+      fillBody.indexOf('if (slot.__index === at && slot.__shown === shown) return Promise.resolve();') &&
+    /slot\.__full\.style\.removeProperty\('opacity'\);/.test(fillBody),
+  `fillBody=${fillBody.length}`
+);
+ok(
+  'jumpTo 同索引也核对当前槽画的是不是本次集合（换会话不留旧图）',
+  /if \(target === this\.index\) \{/.test(jumpBody) &&
+    /const want = item \? thumbUrl\(item\.id\) : '';/.test(jumpBody) &&
+    /this\.currentSlot\?\.__low\?\.__want !== want/.test(jumpBody) &&
+    /slot\.__index = -2;/.test(jumpBody) &&
+    /this\.fill\(this\.slots\[1\], target, view\);/.test(jumpBody) &&
+    /this\.startFullLoad\(\);/.test(jumpBody)
+);
+const openBody = viewerCode.slice(
+  viewerCode.indexOf('open(index, options = {})'),
+  viewerCode.indexOf('boost(el, anim)')
+);
+ok(
+  '开场淡入不把 opacity:0 写进 inline（否则播完又回到透明）',
+  !/slide\.style\.opacity = '0'/.test(openBody)
+);
+ok(
+  '关闭动画有意把当前槽置 0 仍在（别被可见性兜底误删）',
+  /slide\.style\.opacity = '0';/.test(viewerCode) &&
+    /resetSlots\(\);/.test(viewerCode)
+);
+
 /* ---------------- 汇总 ---------------- */
 
 if (problems) {

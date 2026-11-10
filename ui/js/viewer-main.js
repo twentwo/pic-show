@@ -17,6 +17,7 @@ import { waitFor, withTimeout } from './async.js';
 import { Viewer } from './viewer.js';
 import { initTheme, mountThemeToggles } from './theme.js';
 import { viewportFillsScreen, viewportMatches, viewportRectFrom } from './launch.js';
+import { installWheelPhaseProbe, setWheelPhaseSink } from './wheel-phase.js';
 
 const el = (id) => document.getElementById(id);
 
@@ -206,6 +207,14 @@ async function boot() {
     if (warning) warning.hidden = false;
     return;
   }
+
+  // 原生 wheel 相位：后端在 macOS 上默认安装本地监视器，一次手势只发
+  // begin / end 两类语义（`PICSHOW_WHEEL_PHASE=0` 可关，用于 65ms 兜底 A/B）。
+  // 先把接收端接到 viewer（真正结算仍在 gestures 那条唯一路径上），再挂监听，
+  // 最后才报 listening —— 与 viewer-goto 同一个顺序约束。没有原生事件时
+  // 65ms 静默兜底原样运行，预览不会因此失灵。
+  setWheelPhaseSink((kind) => viewer.handleWheelPhase(kind));
+  await installWheelPhaseProbe().catch(() => {});
 
   // 顺序要紧：先挂上监听，再告诉后端「我能收了」。反过来会在两条路之间开一
   // 个缝 —— 后端正好在中间发来的那次请求掉进黑洞（与 `take_launch_target`

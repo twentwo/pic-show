@@ -1,6 +1,6 @@
 [package]
 name = "picshow"
-version = "0.1.3"
+version = "0.1.4"
 description = "PicShow - 沉浸式跨平台照片查看器"
 authors = ["PicShow"]
 edition = "2021"
@@ -42,13 +42,21 @@ parking_lot = "0.12"
 # 版本跟着 tao 内部用的那份走，属于同一个已编译依赖，不会带来额外构建成本。
 # NSWorkspace / NSRunningApplication / libc 三个 feature 只为读前台应用与按 pid
 # 找回它，都是同一个已编译 crate 里的模块，不引入新的三方依赖。
+#
+# NSEvent + block2 供 `src/wheel_phase.rs` 的原生相位主判据使用（默认开启）：
+# addLocalMonitorForEventsMatchingMask:handler: 的绑定带 block 参数，需要这两个
+# feature。block2 本来就是 tao/objc2-app-kit 的依赖（lock 里已有 0.6.2），
+# 这里只是显式声明直接依赖，不新增编译单元。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+block2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSWindow",
     "NSWorkspace",
     "NSRunningApplication",
+    "NSEvent",
+    "block2",
     "libc",
 ] }
 

@@ -233,6 +233,9 @@ const prefetched = new Map();
 const MAX_DECODED = 24;
 const decoded = new Map();
 
+/** 等一张新节点解码完成的最长时间；超时交回 null，调用方继续保留旧像素 */
+const DECODE_WAIT_MS = 1200;
+
 /**
  * 取走一张已解码的图片节点；没有（或已被取走）返回 null。
  * @param {string} src
@@ -245,6 +248,52 @@ export function takeDecoded(src) {
     const at = kept.indexOf(img);
     if (at >= 0) kept.splice(at, 1);
     return img;
+}
+
+/**
+ * 给槽位换源用：拿一张**已经解码好、还没挂进 DOM** 的 <img>。
+ *
+ * `preload()` 是「顺手预热」，兑现时机不受调用方控制；而 `fill()` 是同步发生的，
+ * 池里那一刻不一定有货 —— 尤其是**反向滑回**一张早就取过的图：那个节点已经被
+ * 上一个槽取走，`prefetched` 又按 URL 缓存了 promise，不会再造一个进池。这时
+ * 若退回给槽里的 <img> 直接设 src，会先把旧像素抹掉、再等一次请求和解码，
+ * 跟手的第一帧就露出背景。
+ *
+ * 慢路径因此新建一个独立节点，等它自己 decode 完再交给调用方：挂进 DOM 之前
+ * 像素就已经在位，替换是原子的，槽里一帧都不会空。URL 通常已被预热进内存
+ * 缓存，这一步只是复用位图，不再来一次网络往返。失败 / 超时兑现 null，
+ * 调用方保留旧像素，不换成一张空图。
+ *
+ * @param {string} src
+ * @returns {Promise<HTMLImageElement|null>}
+ */
+export function decodedImage(src) {
+    if (!src) return Promise.resolve(null);
+    const ready = takeDecoded(src);
+    if (ready) return Promise.resolve(ready);
+
+    const img = new Image();
+    img.decoding = 'async';
+    img.src = src;
+    return new Promise((resolve) => {
+        let timer = 0;
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(img.naturalWidth > 0 ? img : null);
+        };
+        timer = setTimeout(finish, DECODE_WAIT_MS);
+        if (typeof img.decode === 'function') {
+            img.decode().then(finish, finish);
+        } else if (img.complete) {
+            finish();
+        } else {
+            img.onload = finish;
+            img.onerror = finish;
+        }
+    });
 }
 
 /**

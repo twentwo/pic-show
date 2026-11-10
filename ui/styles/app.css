@@ -630,6 +630,40 @@ body.is-dragging::after {
   pointer-events: none;
 }
 
+/*
+  到首 / 末张时那层「边缘阴影」：只画在 stage 的可见带里，且不拦点击。
+  它由 viewer.js 在 stage 之后、chrome 之前插入，DOM 顺序保证它压在画面上、
+  控件压在它上面，不需要再引入 z-index。
+
+  颜色取 --viewer-bg —— 深色主题把画面压暗、浅色主题把画面提亮，两种主题下
+  都是「往预览背景里淡出去」，不必为这一层再引入一套颜色令牌。宽度固定，
+  靠 transform: scaleX() 从外侧边往里长：跟手期只改 transform / opacity，
+  不触发布局；is-left / is-right 的 transform-origin 都贴着外侧边，缩放才是
+  「从那条边拉长」而不是从中间撑开。
+*/
+.viewer-edge-shade {
+  position: absolute;
+  top: var(--chrome-top);
+  bottom: var(--strip-h);
+  width: 36px;
+  pointer-events: none;
+  opacity: 0;
+  transform: scaleX(0);
+  will-change: transform, opacity;
+}
+
+.viewer-edge-shade.is-right {
+  right: 0;
+  transform-origin: right center;
+  background: linear-gradient(to left, var(--viewer-bg), transparent);
+}
+
+.viewer-edge-shade.is-left {
+  left: 0;
+  transform-origin: left center;
+  background: linear-gradient(to right, var(--viewer-bg), transparent);
+}
+
 /* 横向轨道：三个槽依次排开，宽度各占一屏，靠 translateX 决定看哪一张。
 
    `touch-action: none` 必须挂在轨道而不是整个 `.viewer` 上：

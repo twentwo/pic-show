@@ -1593,8 +1593,8 @@
         `index ${noiseBefore} → ${viewer.index}，scale=${viewer.g.scale.toFixed(3)}`
       );
 
-      // 17.2 连续跨多张：一屏 = 一张，推得越远跨得越多（旧契约「一次只翻一张」
-      //      已反转）。delta 按视口宽取，两种窗口尺寸下都能稳定跨过 ≥2 张。
+      // 17.2 一次滑动只切一张：从起手到流停下是一整段 wheel 事件，流中间
+      //      零次换页。甩几十屏、惯性尾巴再长，索引也只在结算时到相邻那张。
       await twOpen(1);
       const longBefore = viewer.index;
       const step17 = Math.max(20, Math.ceil(viewer.slotWidth() / 12));
@@ -1607,31 +1607,42 @@
         wheel({ deltaX: d, deltaY: 0 });
       }
       ok(
-        '17.2a 一次长距离横滑连续跨过至少两张（不再只翻一张）',
-        viewer.index >= longBefore + 2,
+        '17.2a 一次长距离横滑，流中间一次都不换页',
+        viewer.index === longBefore,
         `${longBefore} → ${viewer.index}`
       );
       ok(
-        '17.2b 不再有 locked 状态（惯性尾巴不会被吞掉）',
-        viewer.g.wheelSwipe.locked === undefined,
-        String(viewer.g.wheelSwipe.locked)
+        '17.2b 不再有 locked 状态；改用「一段流只结算一次」的 settled 闸门',
+        viewer.g.wheelSwipe.locked === undefined &&
+          viewer.g.wheelSwipe.settled === false,
+        `locked=${viewer.g.wheelSwipe.locked} settled=${viewer.g.wheelSwipe.settled}`
       );
 
-      // 17.2c 同一段还没停（中间没有静默）就继续堆位移，会继续推进
+      // 17.2c 同一段还没停（中间没有静默）就继续堆位移，也不许推进
       const midLong = viewer.index;
       for (let i = 0; i < 20; i += 1) {
         await sleep(16);
         wheel({ deltaX: step17, deltaY: 0 });
       }
       ok(
-        '17.2c 同一段里继续堆位移继续推进（连续语义）',
-        viewer.index > midLong,
+        '17.2c 同一段里继续堆位移也不会跨到第二张',
+        viewer.index === midLong,
         `${midLong} → ${viewer.index}`
       );
       await settle(400);
+      ok(
+        '17.2d 流停下只切相邻一张（甩了几十屏也只 +1）',
+        viewer.index === longBefore + 1,
+        `${longBefore} → ${viewer.index}`
+      );
+      ok(
+        '17.2e 结算闸门已置起，惯性尾巴 / 重复回调不会翻第二张',
+        viewer.g.wheelSwipe.settled === true,
+        String(viewer.g.wheelSwipe.settled)
+      );
 
       // 17.3 抬手（静默）之后再滑：必须立刻还能翻 —— 「不灵敏」的回归点
-      //      17.2 已经把索引推到后半段了，这里重新起一个干净的场景，免得撞到
+      //      17.2 的闸门要由静默够久来复位；这里重新起一个干净场景，免得撞到
       //      图库末尾把「还能翻」误判成「到头了」。
       await twOpen(1);
       const chainBefore = viewer.index;
@@ -1687,17 +1698,409 @@
       );
       ok('17.7b 放大态下横向 wheel 不翻页', viewer.index === 2, String(viewer.index));
 
-      // 17.8 到首尾：给回弹而不是静默吞掉
+      // 17.8 到首尾：不循环、不越界、不空白，只给当前图一次回弹
       await twOpen(0);
       clearAnimations();
       await swipeOnce(-1);
       await settle(300);
-      ok('17.8a 第一张继续往前不切图', viewer.index === 0, String(viewer.index));
-      await sleep(80);
+      ok('17.8a 第一张继续往前不切图（不绕回末张）', viewer.index === 0, String(viewer.index));
       ok(
-        '17.8b 到头时有回弹反馈（不是毫无动静）',
-        lastOf(viewer.track) !== null,
-        String(lastOf(viewer.track)?.options?.duration)
+        '17.8b 到头时当前图有自然回弹（CSS 过渡把弹性量收回 0，轨道不动）',
+        viewer.currentSlot.__seam === 0 &&
+          /transform 200ms/.test(viewer.currentSlot.__low.style.transition) &&
+          lastOf(viewer.track) === null,
+        `seam=${viewer.currentSlot.__seam} transition=${viewer.currentSlot.__low.style.transition}`
+      );
+      ok(
+        '17.8b2 首张边界不露空白：三个槽都还有可画的图片',
+        viewer.slots.every((s) => Boolean(s.__low.getAttribute('src'))),
+        viewer.slots.map((s) => s.__low.getAttribute('src')).join(' | ')
+      );
+      await viewer.close();
+
+      // 末张继续请求下一张：同一套边界，只是方向相反。这里还特意把循环开关
+      // 打开 —— wheel 的边界判定只看「相邻一张是否还在列表里」，绝不能被
+      // 按钮 / 键盘那条允许循环的路径带到另一头去。
+      await twOpen(items.length - 1);
+      clearAnimations();
+      viewer.setLoop(true);
+      const lastIdx17 = viewer.index;
+      const lastSrc17 = viewer.currentSlot.__low.getAttribute('src');
+      await swipeOnce(1);
+      await settle(300);
+      ok(
+        '17.8c 末张继续往后不切图、不循环回首张（即使 loop 开着）',
+        viewer.index === lastIdx17 && lastIdx17 === items.length - 1,
+        `${lastIdx17} → ${viewer.index}`
+      );
+      ok(
+        '17.8d 末张边界不露空白：越界槽用当前图保底，当前槽仍是当前图',
+        viewer.slots.every((s) => Boolean(s.__low.getAttribute('src'))) &&
+          viewer.currentSlot.__low.getAttribute('src') === lastSrc17,
+        viewer.slots.map((s) => s.__low.getAttribute('src')).join(' | ')
+      );
+      ok(
+        '17.8e 末张只让当前图产生回弹（200ms 过渡、索引不变、轨道无动画）',
+        viewer.currentSlot.__seam === 0 &&
+          /transform 200ms/.test(viewer.currentSlot.__low.style.transition) &&
+          lastOf(viewer.track) === null && viewer.index === lastIdx17,
+        `seam=${viewer.currentSlot.__seam} transition=${viewer.currentSlot.__low.style.transition} index=${viewer.index}`
+      );
+      viewer.setLoop(false);
+      await viewer.close();
+
+      // 17.19 末张边界：视图稳定停留末张，不出现「进入下一张」的过渡边缘。
+      //      旧实现把 90px 阻尼写进轨道，还让 followWheelSeam() 给越界槽（装着
+      //      当前图副本）贴边 —— 真 DOM 实测轨道 -86px / 右槽贴边 -117px，从右
+      //      边缘进来的其实是同一张图。现在边界段轨道恒在基准、越界槽一像素都
+      //      不画，只让当前图弹性偏一点，流停下弹回居中。两种视口都要过：窄屏
+      //      图片按宽度铺满时同样不许露出邻槽边缘。
+      await twOpen(items.length - 1);
+      clearAnimations();
+      viewer.setLoop(true); // wheel 的边界判定绝不看循环开关
+      const edgeBase19 = viewer.trackOffset;
+      const edgeIdx19 = viewer.index;
+      const edgeCurSrc19 = viewer.currentSlot.__low.getAttribute('src');
+      const edgeTrack19 = () => {
+        const m = viewer.track.style.transform.match(/translate3d\(([-\d.]+)px/);
+        return m ? Number(m[1]) - edgeBase19 : NaN;
+      };
+      const edgeFrames19 = [];
+      for (const d of [20, 30, 40, 40, 40, 40, 40]) {
+        await sleep(16);
+        wheel({ deltaX: d, deltaY: 0 });
+        edgeFrames19.push({
+          track: Math.round(edgeTrack19()),
+          cur: Math.round(viewer.currentSlot.__seam),
+          right: Math.round(viewer.slots[2].__seam),
+          shown: viewer.slots[2].__shown
+        });
+      }
+      ok(
+        '17.19a 末张继续往下一张滑：轨道逐帧恒在基准（越界槽一像素都不进视口）',
+        edgeFrames19.every((f) => Math.abs(f.track) < 0.5) && viewer.g.swipeX === 0,
+        `track=${edgeFrames19.map((f) => f.track).join(',')} swipeX=${viewer.g.swipeX}`
+      );
+      ok(
+        '17.19b 越界槽不贴边、不重填；只有当前图有一点弹性位移（≤22px）',
+        edgeFrames19.every((f) => f.right === 0 && f.shown === edgeIdx19) &&
+          edgeFrames19.some((f) => f.cur !== 0) &&
+          Math.abs(viewer.currentSlot.__seam) <= 22.001,
+        JSON.stringify(edgeFrames19)
+      );
+      ok(
+        '17.19c 边界段当前槽内容没被换掉、索引不动',
+        viewer.currentSlot.__low.getAttribute('src') === edgeCurSrc19 &&
+          viewer.index === edgeIdx19,
+        `index=${viewer.index} src=${viewer.currentSlot.__low.getAttribute('src')}`
+      );
+
+      // 回弹（200ms CSS 过渡）还在半路就再滑：新的一段要立刻响应，不能重复
+      // 切换、不能把轨道推偏、也不能留下弹性偏移。
+      await sleep(90); // 65ms 已结算，200ms 过渡尚未结束
+      ok('17.19d 第一段已结算（闸门置起，回弹已开始）',
+        viewer.g.wheelSwipe.settled === true && viewer.currentSlot.__seam === 0,
+        `settled=${viewer.g.wheelSwipe.settled} seam=${viewer.currentSlot.__seam}`);
+      for (const d of [30, 40, 40]) {
+        await sleep(16);
+        wheel({ deltaX: d, deltaY: 0 });
+      }
+      ok(
+        '17.19e 回弹中再滑：新一段仍不切图、轨道仍不动、弹性量仍被夹住',
+        viewer.index === edgeIdx19 && viewer.g.swipeX === 0 &&
+          Math.abs(edgeTrack19()) < 0.5 &&
+          Math.abs(viewer.currentSlot.__seam) <= 22.001 &&
+          viewer.slots[2].__seam === 0,
+        `index=${viewer.index} swipeX=${viewer.g.swipeX} track=${edgeTrack19()} ` +
+          `cur=${viewer.currentSlot.__seam} right=${viewer.slots[2].__seam}`
+      );
+      await settle(300);
+      ok(
+        '17.19f 连续两次边界滑动后：无重复切换、无抖动、无残留偏移',
+        viewer.index === edgeIdx19 && viewer.g.swipeX === 0 &&
+          Math.abs(edgeTrack19()) < 0.5 &&
+          viewer.slots.every((s) => s.__seam === 0) &&
+          /transform 200ms/.test(viewer.currentSlot.__low.style.transition) &&
+          animations.filter((a) => a.el === viewer.track).length === 0,
+        `index=${viewer.index} swipeX=${viewer.g.swipeX} track=${edgeTrack19()} ` +
+          `seams=${viewer.slots.map((s) => s.__seam).join(',')} ` +
+          `transition=${viewer.currentSlot.__low.style.transition}`
+      );
+      viewer.setLoop(false);
+      await viewer.close();
+
+      // 17.20 原生 wheel 相位（AppKit → viewer.handleWheelPhase）：只改结算时机。
+      //      浏览器探针没有 Tauri 后端，直接调 viewer 的转发口验证同一条链路；
+      //      24ms 短刻度、50~58ms 连滑各切一张由 check_wheel_swipe 第 29 组用
+      //      可控时钟钉住，这里不拿真实计时器赌毫秒。
+      await twOpen(2);
+      clearAnimations();
+      const idx20 = viewer.index;
+      await swipeOnce(-1);
+      viewer.handleWheelPhase('end');
+      ok(
+        '17.20a end 落到 gestures：phaseEnded 置起、闸门尚未落下',
+        viewer.g.wheelSwipe.phaseEnded === true &&
+          viewer.g.wheelSwipe.settled === false,
+        `phaseEnded=${viewer.g.wheelSwipe.phaseEnded} settled=${viewer.g.wheelSwipe.settled}`
+      );
+      await settle(300);
+      ok(
+        '17.20b 原生 ended 后只切相邻一张、闸门置起',
+        viewer.index === idx20 - 1 && viewer.g.wheelSwipe.settled === true,
+        `index=${viewer.index}/${idx20 - 1} settled=${viewer.g.wheelSwipe.settled}`
+      );
+      viewer.handleWheelPhase('end');
+      viewer.handleWheelPhase('end');
+      await settle(300);
+      ok(
+        '17.20c 重复 ended / 迟到的惯性尾巴不再翻第二张',
+        viewer.index === idx20 - 1,
+        `index=${viewer.index}/${idx20 - 1}`
+      );
+      const trackBefore20 = viewer.track.style.transform;
+      viewer.handleWheelPhase('begin');
+      ok(
+        '17.20d began 复位 settled / phaseEnded，且一像素轨道都不写',
+        viewer.g.wheelSwipe.settled === false &&
+          viewer.g.wheelSwipe.phaseEnded === false &&
+          viewer.track.style.transform === trackBefore20,
+        `settled=${viewer.g.wheelSwipe.settled} phaseEnded=${viewer.g.wheelSwipe.phaseEnded}`
+      );
+      await swipeOnce(-1); // 这一段故意不再发 end → 退回 65ms 兜底
+      await settle(300);
+      ok(
+        '17.20e began 之后没有 ended：65ms 兜底照常只切一张',
+        viewer.index === idx20 - 2 && viewer.g.wheelSwipe.settled === true,
+        `index=${viewer.index}/${idx20 - 2}`
+      );
+
+      // 末张边界：原生相位绝不能把「只回弹」变成「末张进入下一张」。
+      await twOpen(items.length - 1);
+      clearAnimations();
+      const idx20f = viewer.index;
+      const trackBase20 = viewer.trackOffset;
+      for (const d of [20, 30, 40, 40]) {
+        await sleep(16);
+        wheel({ deltaX: d, deltaY: 0 });
+      }
+      viewer.handleWheelPhase('end');
+      await settle(300);
+      const track20 = Number(
+        (viewer.track.style.transform.match(/translate3d\(([-\d.]+)px/) || [])[1]
+      );
+      ok(
+        '17.20f 末张 + 原生 ended：索引不动、轨道恒基准、贴边全归零',
+        viewer.index === idx20f && Math.abs(track20 - trackBase20) < 0.5 &&
+          viewer.slots.every((s) => s.__seam === 0),
+        `index=${viewer.index}/${idx20f} track=${track20}/${trackBase20} ` +
+          `seams=${viewer.slots.map((s) => s.__seam).join(',')}`
+      );
+      await viewer.close();
+
+      // 17.21 慢滑复位：回弹从这一段交接过来的跟手速度起跑；快滑达标走补完、
+      // 边界段退回原曲线，两条既有观感逐字不变。慢拖 40ms 一帧、总位移几十 px，
+      // 峰值速度远低于 SWIPE_VELOCITY，必定走「未达标 → 回弹」。
+      const bezArgs21 = (s) => ((/cubic-bezier\(([^)]*)\)/.exec(s || '') || [])[1] || '');
+      const y1Of21 = (s) => Number(bezArgs21(s).split(',')[1]);
+      const bezOf21 = (s) => (/cubic-bezier\([^)]*\)/.exec(s || '') || [])[0] || '';
+      await twOpen(2);
+      clearAnimations();
+      const idx21 = viewer.index;
+      const seamBefore21 = viewer.currentSlot.__low.style.transition;
+      await slowDrag([6, 8, 10, 8, 6], 40);
+      await settle(300);
+      const seam21 = viewer.currentSlot.__low.style.transition;
+      const track21 = lastOf(viewer.track);
+      const animEase21 = track21?.options?.easing || '';
+      ok(
+        '17.21a 慢滑回弹：仍是 200ms，但缓动起点被软化（0 < y1 < 0.9，不再是 1）',
+        track21?.options?.duration === 200 &&
+          y1Of21(animEase21) > 0 && y1Of21(animEase21) < 0.9 &&
+          viewer.index === idx21 && viewer.g.swipeX === 0,
+        `anim=${JSON.stringify(track21?.options)} index=${viewer.index} swipeX=${viewer.g.swipeX}`
+      );
+      ok(
+        '17.21b 慢滑回弹：贴边 CSS 与轨道 WAAPI 同源（窄屏 m=0 无贴边曲线时允许缺省）',
+        !bezOf21(seam21) || bezOf21(seam21) === animEase21,
+        `seam=${seam21} animEase=${animEase21} before=${seamBefore21}`
+      );
+
+      // 快滑达标：仍走补完落位，时长随剩余距离收缩（< 200ms），只切相邻一张。
+      await twOpen(2);
+      clearAnimations();
+      const idx21c = viewer.index;
+      await swipeOnce(-1);
+      await settle(300);
+      const land21 = lastOf(viewer.track);
+      ok(
+        '17.21c 快滑复位逐字不变：补完落位短于 200ms、索引只切相邻一张',
+        viewer.index === idx21c - 1 && land21?.options?.duration < 200 &&
+          /cubic-bezier\(/.test(land21?.options?.easing || ''),
+        `index=${viewer.index}/${idx21c - 1} anim=${JSON.stringify(land21?.options)}`
+      );
+
+      // 边界快滑：wheelReboundDistance 退化成 1，y1 顶到 1 → 原 EASE_SOFT。
+      await twOpen(items.length - 1);
+      clearAnimations();
+      const idx21d = viewer.index;
+      await swipeOnce(1);
+      await settle(300);
+      ok(
+        '17.21d 边界快滑回弹仍是 200ms + 原 EASE_SOFT（复位观感不变）',
+        /transform 200ms cubic-bezier\(0\.33, 1, 0\.68, 1\)/.test(
+          viewer.currentSlot.__low.style.transition
+        ) && viewer.index === idx21d && lastOf(viewer.track) === null,
+        `transition=${viewer.currentSlot.__low.style.transition} index=${viewer.index}`
+      );
+
+      // 连续慢滑：回弹没播完就再滑，两段各自结算，不重复切图、无残留偏移。
+      await twOpen(2);
+      clearAnimations();
+      const idx21e = viewer.index;
+      const trackBase21 = viewer.trackOffset;
+      await slowDrag([6, 8, 10, 8, 6], 40);
+      await sleep(90); // 65ms 已结算，200ms 回弹尚未结束
+      ok('17.21e1 第一段慢滑已结算（闸门置起、贴边归零）',
+        viewer.g.wheelSwipe.settled === true &&
+          viewer.slots.every((s) => s.__seam === 0),
+        `settled=${viewer.g.wheelSwipe.settled} seams=${viewer.slots.map((s) => s.__seam).join(',')}`);
+      await slowDrag([8, 10, 8], 40);
+      await settle(300);
+      const trackNow21 = Number(
+        (viewer.track.style.transform.match(/translate3d\(([-\d.]+)px/) || [])[1]
+      );
+      ok(
+        '17.21e 慢滑回弹中连续再滑：不重复切图、轨道回基准、无残留弹性偏移',
+        viewer.index === idx21e && viewer.g.swipeX === 0 &&
+          Math.abs(trackNow21 - trackBase21) < 0.5 &&
+          viewer.slots.every((s) => s.__seam === 0),
+        `index=${viewer.index} swipeX=${viewer.g.swipeX} track=${trackNow21}/${trackBase21}`
+      );
+      await viewer.close();
+
+      /* ---------- 17.22 边界阴影叠加层 ---------------------------------- *
+       * 只加视觉，不动切换 / 结算 / 回弹曲线：DOM 层级与主题同源、跟手时随
+       * 距离拉长且只落在「没有图」那一侧、流停下用与贴边量同一个 timing
+       * 收回，非边界路径与关闭后都不留残影。
+       ------------------------------------------------------------------- */
+      await twOpen(items.length - 1);
+      clearAnimations();
+      const shade22 = viewer.edgeShade;
+      const shadeIdx22 = viewer.index;
+      const shadeBase22 = viewer.trackOffset;
+      const shadeTrack22 = () => {
+        const m = viewer.track.style.transform.match(/translate3d\(([-\d.]+)px/);
+        return m ? Number(m[1]) - shadeBase22 : NaN;
+      };
+      const sxOf22 = (s) => Number((/scaleX\(([-\d.]+)\)/.exec(s || '') || [0, NaN])[1]);
+      const bezOf22 = (s) => (/cubic-bezier\([^)]*\)/.exec(s || '') || [])[0] || '';
+      const durOf22 = (s) => Number((/transform ([\d.]+)ms/.exec(s || '') || [0, 0])[1]);
+      const cs22 = getComputedStyle(shade22);
+      ok(
+        '17.22a 阴影层在 stage 之后 / chrome 之前，不拦点击、初始完全不可见',
+        shade22.parentElement === viewer.root &&
+          shade22.previousElementSibling === viewer.stage &&
+          shade22.nextElementSibling?.classList.contains('viewer-chrome') === true &&
+          cs22.pointerEvents === 'none' &&
+          parseFloat(cs22.width) > 0 && parseFloat(cs22.width) <= 40 &&
+          sxOf22(shade22.style.transform) === 0 &&
+          Number(shade22.style.opacity) === 0,
+        `w=${cs22.width} pe=${cs22.pointerEvents} ` +
+          `t=${shade22.style.transform} o=${shade22.style.opacity}`
+      );
+
+      const shadeFrames22 = [];
+      for (const d of [20, 30, 40, 40, 40]) {
+        await sleep(16);
+        wheel({ deltaX: d, deltaY: 0 });
+        shadeFrames22.push({
+          sx: sxOf22(shade22.style.transform),
+          op: Number(shade22.style.opacity),
+          seam: Math.abs(viewer.currentSlot.__seam),
+          side: shade22.classList.contains('is-right')
+            ? 'right'
+            : shade22.classList.contains('is-left') ? 'left' : '',
+          transition: shade22.style.transition,
+          track: Math.round(shadeTrack22())
+        });
+      }
+      const bg22 = getComputedStyle(shade22).backgroundImage;
+      ok(
+        '17.22b 末张往下一张滑：右边缘阴影随距离拉长、不透明度同步、跟手无缓动',
+        shadeFrames22.every((f) => f.side === 'right' && f.transition === 'none' &&
+          Math.abs(f.track) < 0.5) &&
+          shadeFrames22[0].sx > 0 &&
+          shadeFrames22.every((f, i) => i === 0 || f.sx >= shadeFrames22[i - 1].sx - 1e-6) &&
+          shadeFrames22[4].sx > shadeFrames22[0].sx &&
+          shadeFrames22.every((f) => Math.abs(f.op - f.sx * 0.45) < 0.0001) &&
+          shadeFrames22.every((f) => Math.abs(f.sx - f.seam / 22) < 0.001) &&
+          /linear-gradient/.test(bg22) &&
+          viewer.index === shadeIdx22 && viewer.g.swipeX === 0,
+        JSON.stringify(shadeFrames22)
+      );
+      await settle(300);
+      ok(
+        '17.22c 流停下：阴影与当前图弹性量用同一份时长 / 缓动平滑收回 0',
+        sxOf22(shade22.style.transform) === 0 &&
+          Number(shade22.style.opacity) === 0 &&
+          durOf22(shade22.style.transition) === durOf22(viewer.currentSlot.__low.style.transition) &&
+          bezOf22(shade22.style.transition) === bezOf22(viewer.currentSlot.__low.style.transition) &&
+          bezOf22(shade22.style.transition) !== '' &&
+          viewer.index === shadeIdx22,
+        `shade=${shade22.style.transition} img=${viewer.currentSlot.__low.style.transition}`
+      );
+
+      // 首张往「上一张」滑：同一层阴影应换到左边缘，不残留上一侧的方向类。
+      await viewer.close();
+      await twOpen(0);
+      clearAnimations();
+      const shadeFirst22 = viewer.index;
+      for (const d of [-20, -30, -40, -40]) {
+        await sleep(16);
+        wheel({ deltaX: d, deltaY: 0 });
+      }
+      ok(
+        '17.22d 首张往上一张滑：阴影改落在左边缘，且仍随距离拉长',
+        shade22.classList.contains('is-left') &&
+          !shade22.classList.contains('is-right') &&
+          sxOf22(shade22.style.transform) > 0 &&
+          Math.abs(sxOf22(shade22.style.transform) -
+            Math.abs(viewer.currentSlot.__seam) / 22) < 0.001 &&
+          viewer.index === shadeFirst22 && viewer.g.swipeX === 0,
+        `class=${shade22.className} t=${shade22.style.transform} ` +
+          `seam=${viewer.currentSlot.__seam}`
+      );
+      await settle(300);
+
+      // 正常方向（不在边界）完全不该出现阴影，索引行为也不能被它改动。
+      await viewer.close();
+      await twOpen(2);
+      clearAnimations();
+      const idx22e = viewer.index;
+      await slowDrag([6, 8, 10, 8, 6], 40);
+      await settle(300);
+      ok(
+        '17.22e 非边界正常路径：阴影完全不出现，索引照常不变',
+        sxOf22(shade22.style.transform) === 0 &&
+          Number(shade22.style.opacity) === 0 &&
+          !shade22.classList.contains('is-left') &&
+          !shade22.classList.contains('is-right') &&
+          viewer.index === idx22e,
+        `t=${shade22.style.transform} o=${shade22.style.opacity} ` +
+          `idx=${viewer.index}/${idx22e}`
+      );
+      await viewer.close();
+      ok(
+        '17.22f 关闭后硬清空：阴影归零且不带 transition / 方向类',
+        shade22.style.transition === 'none' &&
+          sxOf22(shade22.style.transform) === 0 &&
+          Number(shade22.style.opacity) === 0 &&
+          !shade22.classList.contains('is-left') &&
+          !shade22.classList.contains('is-right') &&
+          shade22.nextElementSibling?.classList.contains('viewer-chrome') === true,
+        `t=${shade22.style.transition} o=${shade22.style.opacity} ` +
+          `class=${shade22.className}`
       );
 
       // 17.9 右边缘留给 macOS 通知中心
@@ -1904,6 +2307,355 @@
       ok('17.15d 打断回弹本身不会误翻页', viewer.index === 2, String(viewer.index));
       await settle(300);
 
+      // 17.16 目标图第一帧就位：位置由三槽轨道 + 连续位移保证（17.1~17.15），
+      //       这里只核对「换源那一帧槽里有没有像素」。旧 fill() 直接给底图设新
+      //       src，会先抹掉旧像素再等 img:// 请求与解码 —— 起手 / 连续换槽的
+      //       那一两帧就露成背景；越界槽更被显式清空，首尾阻尼直接拉出黑边。
+      await twOpen(2);
+      ok(
+        '17.16a 左右邻槽开场后都带着图片地址（起手第一帧不是空槽）',
+        Boolean(viewer.slots[0].__low.getAttribute('src')) &&
+          Boolean(viewer.slots[2].__low.getAttribute('src')),
+        `left=${viewer.slots[0].__low.getAttribute('src')} right=${viewer.slots[2].__low.getAttribute('src')}`
+      );
+
+      const edgeSlot = viewer.slots[0];
+      edgeSlot.__index = -2; // 强制重填，模拟「滑到首张时轮转出来的越界槽」
+      viewer.fill(edgeSlot, -1);
+      ok(
+        '17.16b 首张/末张的越界槽有当前图保底，不被清成背景占位',
+        Boolean(edgeSlot.__low.getAttribute('src')),
+        String(edgeSlot.__low.getAttribute('src'))
+      );
+
+      // 换源原子性：槽里已有像素时，fill 当帧旧节点必须还在 DOM、还带着旧地址。
+      // 用一张立刻可解码的 1x1 data URL 当新图，避免探针里再引入网络等待。
+      const paintedSlot = viewer.slots[2];
+      const painted = paintedSlot.__low;
+      const oldSrc = painted.getAttribute('src');
+      Object.defineProperty(painted, 'naturalWidth', { configurable: true, value: 640 });
+      painted.__want = oldSrc;
+      viewer.swapSlotImage(
+        paintedSlot,
+        '__low',
+        'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+        'slide-low'
+      );
+      ok(
+        '17.16c 换源当帧旧像素仍在 DOM（没有「先清后取」的空白帧）',
+        painted.parentNode === paintedSlot && painted.getAttribute('src') === oldSrc,
+        `parent=${painted.parentNode === paintedSlot} src=${painted.getAttribute('src')}`
+      );
+      delete painted.naturalWidth;
+      await settle(60);
+      await viewer.close();
+
+      /* ---------- 17.17 目标图贴边跟随：起手第一帧就进视口 ---------- *
+       * `.slide img` 是 object-fit: contain 居中排的，槽里左右留白会先于图片
+       * 进入视口（竖幅照片能到三四百 px）。旧行为：轨道已经动了十几像素，
+       * 目标图却还在视口外 —— 槽里不是没有像素，是**图片没贴着边缘**。
+       * 这里量「目标图片近边 vs 目标槽近边」，两者之差就是要先露出的留白。 */
+      const { thumbUrl: probeThumb } = await import('./js/api.js');
+      await twOpen(2);
+      const seamFrames = [];
+      for (const dd of [12, 18, 24, 30, 36, 42]) {
+        await sleep(18);
+        wheel({ deltaX: -dd, deltaY: 0 });
+        const sx = viewer.g.swipeX;
+        const dir = sx < 0 ? 1 : -1;
+        const ts = viewer.slots[1 + dir];
+        const sr = ts.getBoundingClientRect();
+        const ir = ts.__low.getBoundingClientRect();
+        seamFrames.push({
+          sx,
+          dir,
+          gap: dir < 0 ? sr.right - ir.right : ir.left - sr.left,
+          near: dir < 0 ? ir.right : ir.left,
+          slideNear: dir < 0 ? sr.right : sr.left,
+          index: ts.__index,
+          src: ts.__low.getAttribute('src'),
+          currentSrc: viewer.currentSlot.__low.getAttribute('src')
+        });
+      }
+      ok(
+        '17.17a 起手第一帧目标图就贴着对应侧边缘（可见宽度≈跟手位移，不先露留白）',
+        seamFrames[0].sx > 0 && seamFrames[0].gap >= -2 && seamFrames[0].gap <= 3,
+        `gap=${seamFrames[0].gap.toFixed(1)} swipeX=${seamFrames[0].sx.toFixed(1)}`
+      );
+      ok(
+        '17.17b 目标图的进入位置/可见区域随 wheel 进度连续同步（单调、无跳变）',
+        seamFrames.every((f, i) => i === 0 ||
+          (f.near > seamFrames[i - 1].near + 1 &&
+            f.gap >= seamFrames[i - 1].gap - 1 &&
+            Math.abs((f.slideNear - f.near) - (seamFrames[i - 1].slideNear - seamFrames[i - 1].near)) < 25)) &&
+          seamFrames[5].near - seamFrames[0].near > 100,
+        seamFrames.map((f) => `${f.near.toFixed(0)}/${f.gap.toFixed(0)}`).join(' → ')
+      );
+      ok(
+        '17.17c 两张图同时在场：目标槽装目标那张，当前槽装当前那张',
+        seamFrames.every((f) => f.index === 1 &&
+          f.src === probeThumb(items[1].id) &&
+          f.currentSrc === probeThumb(items[2].id)),
+        seamFrames[0].src + ' | ' + seamFrames[0].currentSrc
+      );
+      await settle(300);
+      ok(
+        '17.17d 流结束后贴边量全部归零（收尾态与键盘/按钮切图一致）',
+        viewer.slots.every((s) => s.__seam === 0 &&
+          !s.__low.style.transform && !s.__full.style.transform),
+        viewer.slots.map((s) => `${s.__seam}/${s.__low.style.transform}`).join(' | ')
+      );
+      await viewer.close();
+
+      // 取消（慢拖未达阈值 → 回弹）也必须把贴边量收回去
+      await twOpen(2);
+      for (const dd of [12, 18, 24, 20, 16]) {
+        await sleep(18);
+        wheel({ deltaX: -dd, deltaY: 0 });
+      }
+      await settle(300);
+      ok(
+        '17.17e 取消回弹后同样归零，不留悬空的贴边偏移',
+        viewer.slots.every((s) => s.__seam === 0 &&
+          !s.__low.style.transform && !s.__full.style.transform),
+        viewer.slots.map((s) => `${s.__seam}/${s.__low.style.transform}`).join(' | ')
+      );
+      await viewer.close();
+
+      // 一段流里中途掉头：贴边量要立刻换到另一侧，旧侧归零。
+      // 断言不能假设「一定存在居中留白」：窄屏 414px 下 16:9 的图按宽度铺满，
+      // seamMargin === 0，本来就没有留白可挪，贴边量正确值就是 0。这里改成
+      // 钉「公式 + 换边 + 旧侧归零 + 近边留白被消掉」，与视口尺寸无关；
+      // 桌面（有留白）仍额外要求贴边量真的非零。
+      await twOpen(2);
+      for (const dd of [-12, -18, 30, 40, 50]) {
+        await sleep(16);
+        wheel({ deltaX: dd, deltaY: 0 });
+      }
+      const turnedSx = viewer.g.swipeX;
+      const turnedDir = turnedSx < 0 ? 1 : -1;
+      const turnedTarget = viewer.slots[1 + turnedDir];
+      const turnedOld = viewer.slots[1 - turnedDir];
+      const flowW = viewer.g.wheelSwipe.viewW || viewer.slotWidth();
+      const turnedMargin = viewer.seamMargin(turnedTarget, flowW);
+      const turnedProgress = Math.min(1, Math.abs(turnedSx) / Math.max(1, flowW));
+      const expectedSeam = -turnedDir * turnedMargin * (1 - turnedProgress);
+      const turnedWanted = viewer.index + turnedDir;
+      const turnedAt = turnedWanted >= 0 && turnedWanted < items.length ? turnedWanted : -1;
+      const tSlotRect = turnedTarget.getBoundingClientRect();
+      const tImgRect = turnedTarget.__low.getBoundingClientRect();
+      const turnedGap = turnedDir < 0
+        ? tSlotRect.right - tImgRect.right
+        : tImgRect.left - tSlotRect.left;
+      ok(
+        '17.17f 中途反向时贴边量跟着换边，旧目标槽不再带偏移',
+        Math.abs(turnedSx) > 0 &&
+          Math.abs((turnedTarget.__seam ?? 0) - expectedSeam) < 1 &&
+          (turnedOld.__seam ?? 0) === 0 &&
+          turnedTarget.__index === turnedAt &&
+          Math.abs(turnedGap - turnedMargin * turnedProgress) < 3 &&
+          (turnedMargin === 0 || Math.abs(turnedTarget.__seam ?? 0) > 0),
+        `swipeX=${turnedSx.toFixed(1)} margin=${turnedMargin.toFixed(1)} ` +
+          `expect=${expectedSeam.toFixed(1)} gap=${turnedGap.toFixed(1)} ` +
+          `left=${viewer.slots[0].__seam} right=${viewer.slots[2].__seam} ` +
+          `target=${turnedTarget.__index}/${turnedAt}`
+      );
+      await settle(300);
+      await viewer.close();
+
+      /* ---------- 17.18 落位速度连续：无硬停顿、无慢速居中 ---------- *
+       * 旧的固定 180ms + EASE(.22,1,.36,1)：前 13% 时间走完近半程、末 1/3
+       * 时间只挪约 1% —— 目标图在接近居中处先「硬停」，再以近零速度爬完最后
+       * 几 px。这里把**真正传给 animate()** 的时长 / 缓动取出来，解析贝塞尔
+       * 逐点量速度；静态检查只看得到源码里有没有那个公式。
+       ---------------------------------------------------------------- */
+      const bez3 = (t, p1, p2) =>
+        3 * (1 - t) ** 2 * t * p1 + 3 * (1 - t) * t * t * p2 + t ** 3;
+      const bezProgress = (u, x1, y1, x2, y2) => {
+        let lo = 0;
+        let hi = 1;
+        for (let i = 0; i < 44; i += 1) {
+          const m = (lo + hi) / 2;
+          if (bez3(m, x1, x2) < u) lo = m;
+          else hi = m;
+        }
+        return bez3((lo + hi) / 2, y1, y2);
+      };
+      const landParams = (anim) => {
+        const px = (v) => parseFloat(/translate3d\(\s*(-?[\d.]+)px/.exec(String(v))[1]);
+        const m = /cubic-bezier\(([-\d.]+),\s*([-\d.]+),\s*([-\d.]+),\s*([-\d.]+)\)/.exec(
+          anim?.options?.easing || ''
+        );
+        if (!m || !Array.isArray(anim?.keyframes?.transform)) return null;
+        const e = m.slice(1).map(Number);
+        const dist = Math.abs(px(anim.keyframes.transform[1]) - px(anim.keyframes.transform[0]));
+        const duration = anim.options.duration;
+        const vAt = (u) => {
+          const h = 0.002;
+          const a = Math.max(0, u - h);
+          const b = Math.min(1, u + h);
+          return ((bezProgress(b, ...e) - bezProgress(a, ...e)) / (b - a)) * dist / duration;
+        };
+        let lo = 0;
+        let hi = 1;
+        for (let i = 0; i < 44; i += 1) {
+          const m2 = (lo + hi) / 2;
+          if (bezProgress(m2, ...e) < 0.99) lo = m2;
+          else hi = m2;
+        }
+        return {
+          e,
+          dist,
+          duration,
+          easing: anim.options.easing,
+          vStart: vAt(0.001),
+          v85: vAt(0.85),
+          u99: (lo + hi) / 2
+        };
+      };
+
+      // 记录 wheelLandTiming 的实参：补完时贴边归零与 go() 各调一次，必须同源
+      const timingCalls = [];
+      const realTiming = viewer.wheelLandTiming.bind(viewer);
+      viewer.wheelLandTiming = (d, v) => {
+        const out = realTiming(d, v);
+        timingCalls.push({ d, v, ...out });
+        return out;
+      };
+      // 贴边量的 CSS transition 在 rebalance() 里会被 clearSlotSeam 清掉，
+      // 只能在 releaseWheelSeam 刚刚写完的那一刻抓
+      let seamTransition = '';
+      const realRelease = viewer.releaseWheelSeam.bind(viewer);
+      viewer.releaseWheelSeam = (...args) => {
+        // 必须把 timing 原样返回：onWheelSettle 的返回值要交给 reboundWheelSwipe，
+        // 否则探针里轨道动画会退回旧曲线、与贴边量不同源。
+        const timing = realRelease(...args);
+        const img = viewer.slots
+          .map((s) => s.__low)
+          .find((n) => /^transform [\d.]+ms cubic-bezier\(/.test(n?.style?.transition || ''));
+        seamTransition = img?.style.transition || '';
+        return timing;
+      };
+
+      // 长甩：显示位移被压到接近一屏，落位只剩几十 px 的余数
+      await twOpen(1);
+      clearAnimations();
+      timingCalls.length = 0;
+      seamTransition = '';
+      const longStep18 = Math.max(20, Math.ceil(viewer.slotWidth() / 12));
+      for (let i = 0; i < 40; i += 1) {
+        await sleep(16);
+        wheel({ deltaX: longStep18, deltaY: 0 });
+      }
+      for (const d of [22, 19, 16, 13, 10, 8, 6, 4, 3, 2]) {
+        await sleep(16);
+        wheel({ deltaX: d, deltaY: 0 });
+      }
+      await settle(300);
+      const longLand = landParams(lastOf(viewer.track));
+      const longTiming = timingCalls.slice();
+
+      // 轻甩：只推进约 285px，落位还要补大半屏
+      await twOpen(1);
+      clearAnimations();
+      timingCalls.length = 0;
+      seamTransition = '';
+      await swipeOnce(-1);
+      await settle(300);
+      const shortLand = landParams(lastOf(viewer.track));
+      const shortTiming = timingCalls.slice();
+      const shortSeam = seamTransition;
+
+      ok(
+        '17.18a 落位时长随剩余距离收缩：接近居中的长甩明显短于 180ms，轻甩仍在上限内',
+        longLand && shortLand &&
+          longLand.duration >= 24 && longLand.duration < 180 &&
+          shortLand.duration >= 24 && shortLand.duration <= 180 &&
+          longLand.duration < shortLand.duration,
+        `long=${longLand?.duration}/${longLand?.dist?.toFixed(1)}px ` +
+          `short=${shortLand?.duration}/${shortLand?.dist?.toFixed(1)}px`
+      );
+
+      ok(
+        '17.18b 缓动起点速度 = 交接的跟手速度、终点速度 = 0（y2=1 且 y1≤1 不过冲）',
+        longLand && shortLand &&
+          longLand.e[3] === 1 && shortLand.e[3] === 1 &&
+          longLand.e[1] >= 0 && longLand.e[1] <= 1 &&
+          shortLand.e[1] >= 0 && shortLand.e[1] <= 1 &&
+          longTiming.length === 2 && shortTiming.length === 2 &&
+          Math.abs(longLand.vStart - longTiming[1].velocity) < 0.08 &&
+          Math.abs(shortLand.vStart - shortTiming[1].velocity) < 0.08,
+        `long v0=${longTiming[1]?.velocity} vStart=${longLand?.vStart?.toFixed(3)} ` +
+          `short v0=${shortTiming[1]?.velocity} vStart=${shortLand?.vStart?.toFixed(3)}`
+      );
+
+      ok(
+        '17.18c 接近居中不再硬停：85% 时刻仍有速度，最后 1% 行程不占掉大半段落位时间',
+        longLand && shortLand &&
+          longLand.v85 / longLand.vStart >= 0.1 &&
+          shortLand.v85 / shortLand.vStart >= 0.1 &&
+          longLand.u99 >= 0.8 && shortLand.u99 >= 0.8,
+        `long v85/v0=${(longLand?.v85 / longLand?.vStart)?.toFixed(3)} u99=${longLand?.u99?.toFixed(3)} ` +
+          `short v85/v0=${(shortLand?.v85 / shortLand?.vStart)?.toFixed(3)} u99=${shortLand?.u99?.toFixed(3)} ` +
+          `（旧 EASE 分别 ≈0.003 / 0.65）`
+      );
+
+      // 窄屏图片按宽度铺满时 m=0，没有可归零的贴边量 —— 那时 releaseWheelSeam
+      // 本来就不写 transition，契约退化为「两次 wheelLandTiming 参数同源」。
+      ok(
+        '17.18d 贴边归零与轨道落位共用同一份时长 / 缓动（无留白视口没有可归零的贴边量）',
+        shortTiming[0].duration === shortTiming[1].duration &&
+          shortTiming[0].easing === shortTiming[1].easing &&
+          (shortSeam === '' ||
+            (shortSeam.includes(`transform ${shortLand?.duration}ms`) &&
+              shortSeam.includes(shortLand?.easing))),
+        `seam="${shortSeam}" land="${shortLand?.duration}ms ${shortLand?.easing}"`
+      );
+
+      // 双向：镜像手势走另一个方向，落位节奏与形状一致
+      await twOpen(3);
+      clearAnimations();
+      timingCalls.length = 0;
+      await swipeOnce(1);
+      await settle(300);
+      const backLand = landParams(lastOf(viewer.track));
+      const backTiming = timingCalls.slice();
+      ok(
+        '17.18e 反方向切换同样连续：起点速度 = v0、终点 = 0、85% 时刻不硬停',
+        backLand && backLand.e[3] === 1 && viewer.index === 4 &&
+          Math.abs(backLand.vStart - backTiming[backTiming.length - 1]?.velocity) < 0.08 &&
+          backLand.v85 / backLand.vStart >= 0.1 && backLand.u99 >= 0.8,
+        `index=${viewer.index} vStart=${backLand?.vStart?.toFixed(3)} ` +
+          `v85/v0=${(backLand?.v85 / backLand?.vStart)?.toFixed(3)} u99=${backLand?.u99?.toFixed(3)}`
+      );
+
+      // 连续快滑：每段各自算一份参数，不复用上一段的残留
+      await twOpen(2);
+      clearAnimations();
+      timingCalls.length = 0;
+      await swipeOnce(-1);
+      await settle(300);
+      await swipeOnce(-1);
+      await settle(300);
+      const twoLands = animations
+        .filter((a) => a.el === viewer.track && a.keyframes?.transform)
+        .map(landParams);
+      ok(
+        '17.18f 连续快滑每段各自算落位时长 / 缓动，同一段内贴边与轨道参数一致',
+        twoLands.length === 2 && twoLands.every((p) =>
+          p && p.duration >= 24 && p.duration <= 180 && p.e[3] === 1 &&
+          p.v85 / p.vStart >= 0.1) &&
+          timingCalls.length === 4 &&
+          timingCalls[0].duration === timingCalls[1].duration &&
+          timingCalls[0].easing === timingCalls[1].easing &&
+          timingCalls[2].duration === timingCalls[3].duration &&
+          timingCalls[2].easing === timingCalls[3].easing,
+        `lands=${twoLands.map((p) => p?.duration).join('/')} calls=${timingCalls.length}`
+      );
+
+      viewer.wheelLandTiming = realTiming;
+      viewer.releaseWheelSeam = realRelease;
+
       /* ---------- 18. 有来源 / 无来源必须是同一份开场 ---------- *
        * 「图片墙点击」和「打开方式」以前各给 open() 配一套 options（一个有
        * fadeIn、一个没有；一个带中心兜底、一个不带），于是同一个全屏预览悄悄
@@ -2082,6 +2834,117 @@
         /el\.style\.willChange = 'transform, opacity';/.test(viewerSrc) &&
           /el\.style\.willChange = '';/.test(viewerSrc)
       );
+
+      /* ---------- 21. 预览显示：每次操作都画着当前选中图片 ---------- */
+      //
+      // 前面所有断言跑在「img:// 加载失败」的无头环境里，量的是几何 / 索引 /
+      // 状态机，量不到「这一格到底有没有图、是不是目标图」。这里把自定义协议
+      // 换成真能加载的 SVG，再用一份干净的 Viewer 实例把「点击打开 → 切换 →
+      // 连续切换 → 隔张跳转 → 关闭再打开 → 换图片集合」整条显示链路量一遍。
+      // 这条回归专治：jumpTo() 的淡入把 inline opacity 留在 0，动画用
+      // fill:'none' 播完又回到 0，当前槽永久全透明（后续 go() 只填轮转出去
+      // 的那一格，透明会一直残留，于是切换 / 连续切换张张空白）。
+      const srcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+      const svgFor = (id) =>
+        'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900">` +
+          `<rect width="1600" height="900" fill="#334466"/>` +
+          `<text x="40" y="80" font-size="40" fill="white">${id}</text></svg>`
+        );
+      Object.defineProperty(HTMLImageElement.prototype, 'src', {
+        configurable: true,
+        get() { return srcDesc.get.call(this); },
+        set(v) {
+          this.__probeSrc = v;
+          if (typeof v === 'string' && v.startsWith('img://localhost/')) {
+            const m = v.match(/^img:\/\/localhost\/[^/]+\/([^?]+)/);
+            srcDesc.set.call(this, svgFor(m ? m[1] : v));
+          } else {
+            srcDesc.set.call(this, v);
+          }
+        }
+      });
+
+      const { thumbUrl } = await import('./js/api.js');
+      const displayRoot = document.getElementById('viewer').cloneNode(true);
+      displayRoot.id = 'viewer-display-probe';
+      displayRoot.hidden = true;
+      displayRoot.querySelector('.viewer-stage').replaceChildren();
+      displayRoot.querySelector('.strip-inner').replaceChildren();
+      document.body.appendChild(displayRoot);
+      const dv = new Viewer({ root: displayRoot, onError: () => {} });
+      const displayItems = (prefix) => Array.from({ length: 6 }, (_, i) => ({
+        id: `${prefix}-${i}`, name: `${prefix}-${i}.jpg`, width: 1600, height: 900
+      }));
+      dv.setItems(displayItems('show'));
+
+      const tick21 = () => new Promise((r) => setTimeout(r, 30));
+      const logical21 = (img) => img?.__want || img?.__probeSrc || '';
+      const idOf21 = (img) => (logical21(img).match(/\/([^/?]+)(?:\?|$)/) || [, ''])[1];
+      const check21 = async (label, expectIndex, prefix = 'show') => {
+        await tick21();
+        const slot = dv.currentSlot;
+        const low = slot?.__low;
+        const wanted = thumbUrl(dv.items[expectIndex].id);
+        const state = {
+          index: dv.index, want: wanted, actual: logical21(low),
+          w: low?.naturalWidth, attached: low?.parentNode === slot,
+          slotOpacity: getComputedStyle(slot).opacity,
+          inlineOpacity: slot.style.opacity,
+          counter: dv.counterEl?.textContent,
+          allAttached: dv.slots.every((s) => s.__low?.parentNode === s)
+        };
+        ok(label,
+          idOf21(low) === `${prefix}-${expectIndex}` &&
+            logical21(low) === wanted &&
+            low?.naturalWidth > 0 && low?.parentNode === slot &&
+            getComputedStyle(slot).opacity === '1' && !slot.style.opacity &&
+            dv.counterEl?.textContent === `${expectIndex + 1} / 6` &&
+            state.allAttached,
+          JSON.stringify(state));
+      };
+
+      dv.openLaunch(2, null);
+      await check21('21.1 点击打开预览：当前槽画着选中图且有像素', 2);
+
+      await dv.go(1);
+      await check21('21.2 切到下一张：目标图正常显示', 3);
+
+      await dv.go(1);
+      await dv.go(1);
+      await check21('21.3 连续切换：每一步都是当前图', 5);
+
+      await dv.go(1);
+      await check21('21.4 末张边界不换页，画面不空白', 5);
+
+      await dv.jumpTo(0);
+      await check21('21.5 胶片条隔张跳转：淡入终值已提交（不再停在 opacity:0）', 0);
+
+      await dv.jumpTo(2);
+      await dv.go(1);
+      await dv.go(1);
+      await dv.go(-1);
+      await check21('21.6 跳转之后连续切换：残留透明不带到后续换页', 3);
+
+      const staleSlot = dv.currentSlot;
+      const staleSrc = logical21(staleSlot.__low);
+      staleSlot.style.opacity = '0';
+      dv.fill(staleSlot, dv.index); // 内容没变 → 提前返回
+      await tick21();
+      ok('21.7 fill 提前返回也清掉残留透明，且不抹掉已有像素',
+        !staleSlot.style.opacity && getComputedStyle(staleSlot).opacity === '1' &&
+          logical21(staleSlot.__low) === staleSrc,
+        `inline=${staleSlot.style.opacity} src=${logical21(staleSlot.__low)}`);
+
+      await dv.close();
+      dv.openLaunch(4, null);
+      await check21('21.8 关闭后再从画廊打开另一张：正常显示', 4);
+
+      dv.setItems(displayItems('new'));
+      await dv.jumpTo(4); // 同一索引、另一份图片集合
+      await check21('21.9 换图片集合同一索引：画面跟着换成新集合', 4, 'new');
+
+      Object.defineProperty(HTMLImageElement.prototype, 'src', srcDesc);
 
       } catch (error) {
         log.push(`THREW ${error && error.stack ? error.stack.split('\n')[0] : String(error)}`);

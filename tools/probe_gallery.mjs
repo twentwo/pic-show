@@ -18,9 +18,13 @@
  * 而页面里没人请求动画帧（真实 Tauri 窗口每帧都在跑，不存在这个问题）。
  * 所以改完尺寸要手动 `pump()` 泵几帧。虚拟时间下每帧约消耗 1000ms 预算，
  * 故 budget 给到 60s。
+ * 注意 3：headless 偶发在输出完整 DOM 后不退出，所以每个视口用独立 profile，
+ * 并给 spawnSync 一个 90s 上限；超时只影响进程退出，已收集的 DOM 照常解析。
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { dirname, resolve } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 
@@ -65,11 +69,16 @@ async function ensureServer() {
 }
 
 function runBrowser(size) {
+  // 每个视口一条独立 profile。headless 默认 profile 被上一个「输出完 DOM 却没
+  // 退出」的实例锁住时，下一个实例会一直等着，看起来像页面脚本卡死；两个视口
+  // 连跑尤其容易撞上。
+  const profile = mkdtempSync(join(tmpdir(), 'picshow-edge-'));
   const res = spawnSync(
     BROWSER,
     [
       '--headless=new',
       '--disable-gpu',
+      `--user-data-dir=${profile}`,
       // `--no-sandbox` 只用于这个本地无头探针：它只加载 127.0.0.1 上的
       // 自有页面。某些环境（CI 容器、受限的终端沙箱）里 Chrome 起不来
       // 自己的沙箱，会报 "Failed to initialize sandbox" 并直接崩退出，
@@ -86,7 +95,15 @@ function runBrowser(size) {
       '--dump-dom',
       URL_PROBE
     ],
-    { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
+    {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      // 本机 Edge 152 headless 偶发在 `--dump-dom` 把完整 DOM 写完之后不退出。
+      // 给 spawnSync 一个上限：超时后它仍会把已收集的 stdout 交回来，
+      // extract() 照样能拿到 `<pre id="out">`，不该把「进程没退出」当成
+      // 探针失败、更不该让 `npm run probe` 无限挂住。
+      timeout: 90000
+    }
   );
   return res.stdout ?? '';
 }

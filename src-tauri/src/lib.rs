@@ -20,6 +20,11 @@ mod state;
 #[cfg(target_os = "macos")]
 mod macos;
 
+// 原生 wheel 相位观测原型（默认关闭，`PICSHOW_WHEEL_PHASE=1` 才装监视器）。
+// 只读旁路：不吞事件、不改窗口、不触发切换，见文件头说明。
+#[cfg(target_os = "macos")]
+mod wheel_phase;
+
 use std::path::PathBuf;
 
 use tauri::{Listener, Manager};
@@ -126,6 +131,17 @@ pub fn run() {
                     handle.run_on_main_thread(crate::macos::apply_immersive_frame)
                 {
                     eprintln!("[picshow] 投递窗口样式设定失败: {e}");
+                }
+
+                // 原生 wheel 相位：默认开启的产品能力（模块内可用 =0 显式关闭）。
+                // 只装一个「原样返回事件」的本地监视器，每手势发 begin / end
+                // 两个语义事件；不碰窗口、不改结算，65ms 静默仍是兜底。
+                let phase_app = app.handle().clone();
+                let phase_install = phase_app.clone();
+                if let Err(e) = phase_app.run_on_main_thread(move || {
+                    crate::wheel_phase::install(phase_install);
+                }) {
+                    eprintln!("[picshow] 投递 wheel-phase 监视器失败: {e}");
                 }
             }
 
