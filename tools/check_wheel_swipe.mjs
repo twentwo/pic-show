@@ -25,7 +25,11 @@
  *      方向 / 位移 / 速度 / 边界回弹一律不动（第 29 组）。
  */
 
+import { readFileSync } from 'node:fs';
 import { Gestures } from '../ui/js/gestures.js';
+
+/** 第 31 组要把真机实测的时间基线钉在**同一份源码常量**上，而不是抄一份数字 */
+const gesturesSrc = readFileSync(new URL('../ui/js/gestures.js', import.meta.url), 'utf8');
 
 /* ---------------- 时钟、定时器与 DOM 的最小替身 ---------------- */
 
@@ -1064,6 +1068,74 @@ const ok = (name, cond, extra = '') => {
   ok('30.4 无上层 timing 的替身逐字退回 200ms / EASE_SOFT（非 viewer 调用不受影响）',
     legacyAnim?.duration === 200 && legacyAnim?.easing === OLD_EASE,
     `anim=${JSON.stringify(legacyAnim && { duration: legacyAnim.duration, easing: legacyAnim.easing })}`);
+}
+
+/* ---------------- 31. 成对阈值基线 + 控制权显式释放 ---------------- */
+// Swiper 的 thresholdDelta / thresholdTime 是**成对**的旋钮；本项目的时间刻度
+// （65 / 24 / 60）必须与实测的位移节奏（段内 ≤37ms、连滑 58ms）一起判读，
+// 单独调一个就会把「50~58ms 连滑」重新吞掉。这里把关系写成可执行断言。
+{
+  const num = (name) =>
+    Number((gesturesSrc.match(new RegExp(`const ${name} = ([\\d.]+);`)) || [])[1]);
+  const endMs = num('WHEEL_GESTURE_END_MS');
+  const phaseMs = num('WHEEL_PHASE_SETTLE_MS');
+  const retryMs = num('WHEEL_SETTLE_RETRY_MS');
+  const maxMs = num('WHEEL_SETTLE_MAX_MS');
+  const gapMs = num('WHEEL_GESTURE_GAP_MS');
+  /** 2026-11-09 Swift 探针真机实测：段内 wheel 间隔上限 / 两次连滑的静默 */
+  const INTRA_FRAME_MAX_MS = 37;
+  const FAST_RELATCH_MS = 58;
+
+  ok('31.1 24 < 37 < 58 < 65：短刻度不会段内提前结算，65ms 兜底会合并 58ms 连滑',
+    phaseMs === 24 && endMs === 65 && retryMs === 60 && maxMs === 600 &&
+      phaseMs < INTRA_FRAME_MAX_MS && INTRA_FRAME_MAX_MS < FAST_RELATCH_MS &&
+      FAST_RELATCH_MS < endMs && retryMs < endMs && endMs < gapMs,
+    JSON.stringify({ phaseMs, endMs, retryMs, maxMs, gapMs }));
+
+  ok('31.2 时间刻度与位移/速度判据同源：65ms 同时管「新的一段」与「兜底结算」',
+    /if \(sincePrev >= WHEEL_GESTURE_END_MS\)/.test(gesturesSrc) &&
+      /WHEEL_PHASE_SETTLE_MS\s*:\s*WHEEL_GESTURE_END_MS/.test(gesturesSrc) &&
+      /SWIPE_DISTANCE_RATIO/.test(gesturesSrc) &&
+      /SWIPE_MIN_PX/.test(gesturesSrc) &&
+      /SWIPE_VELOCITY/.test(gesturesSrc) &&
+      /WHEEL_AXIS_LOCK_PX/.test(gesturesSrc) &&
+      /WHEEL_SWIPE_DEADZONE/.test(gesturesSrc));
+
+  // 失焦 = 交还 wheel 控制权：没有指针按着时旧实现会直接 return，结算定时器
+  // 挂在后台到点仍会翻一页，回来后第一帧还沿用旧的 base / settled。
+  const blurred = harness({ viewW: 1000 });
+  blurred.stream(flick());
+  blurred.g.abort();
+  blurred.idle(200);
+  ok('31.3 失焦释放：撤掉待结算定时器、不后台翻页、状态全清',
+    blurred.fired.length === 0 && blurred.settles.length === 0 &&
+      blurred.g._wheelSettle === 0 && blurred.g.wheelSwipe.x === 0 &&
+      blurred.g.wheelSwipe.base === null && blurred.g.wheelSwipe.settled === false &&
+      blurred.g.wheelSwipe.axis === null,
+    JSON.stringify({ fired: blurred.fired.length, settles: blurred.settles.length,
+      timer: blurred.g._wheelSettle, state: blurred.g.wheelSwipe }));
+
+  // 回来之后重新起手仍是一次干净的一段（释放不是把交互锁死）。
+  blurred.stream(flick());
+  blurred.idle(80);
+  ok('31.4 失焦后再滑：新的手势照常只切相邻一张，无残留偏移',
+    blurred.fired.length === 1 && blurred.fired[0].direction === 1 &&
+      blurred.settles.length === 1 && blurred.g.swipeX === 0,
+    JSON.stringify({ fired: blurred.fired.length, settles: blurred.settles.length }));
+
+  // ctrl+wheel 走同一个命名释放入口：同一次物理手势改判，不留在半张图上。
+  const pinched = harness({ viewW: 1000 });
+  pinched.stream(flick());
+  pinched.g.handleWheelHorizontal(
+    { deltaX: -20, deltaY: 0, ctrlKey: true, clientX: 700, clientY: 400,
+      preventDefault() {} },
+    -20, 0
+  );
+  pinched.idle(200);
+  ok('31.5 ctrl+wheel 改判走同一释放入口：不结算、不切图、轴向作废',
+    pinched.fired.length === 0 && pinched.settles.length === 0 &&
+      pinched.g.wheelSwipe.axis === null && pinched.g.wheelSwipe.x === 0,
+    JSON.stringify({ fired: pinched.fired.length, settles: pinched.settles.length }));
 }
 
 /* ---------------- 汇总 ---------------- */

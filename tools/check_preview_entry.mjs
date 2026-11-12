@@ -95,12 +95,14 @@ function stripComments(src) {
 }
 
 const viewer = read('ui/js/viewer.js');
+const gestures = read('ui/js/gestures.js');
 const main = read('ui/js/main.js');
 const viewerMain = read('ui/js/viewer-main.js');
 const launch = read('ui/js/launch.js');
 const geometry = read('ui/js/geometry.js');
 const css = read('ui/styles/app.css');
 const viewerCode = stripComments(viewer);
+const gesturesCode = stripComments(gestures);
 
 let problems = 0;
 const ok = (name, cond, extra = '') => {
@@ -420,6 +422,39 @@ ok(
   '关闭动画有意把当前槽置 0 仍在（别被可见性兜底误删）',
   /slide\.style\.opacity = '0';/.test(viewerCode) &&
     /resetSlots\(\);/.test(viewerCode)
+);
+
+/* ---------------- 8. 资源就绪状态与结算解耦 ---------------- */
+
+console.log('资源就绪解耦');
+
+// PhotoSwipe 把图片尺寸当**必需输入**；本项目尺寸由 Rust 动态给、像素经解码
+// 后才落地。关键不变量：一段 wheel 手势是否切图只看位移 / 速度 / 边界，不看
+// 「目标图的像素有没有画好」；原图与邻图的补给是结算**之后**的补充动作。
+// 慢盘 / 大图下切换准确性因此不受加载影响，也正好覆盖刚修过的显示异常。
+const settleBody = gesturesCode.slice(
+  gesturesCode.indexOf('settleWheelSwipe(waited = 0) {'),
+  gesturesCode.indexOf('reboundWheelSwipe(timing) {')
+);
+ok(
+  '结算正文不读任何像素 / 解码 / 图片节点（图片没就绪也能判定切一张）',
+  settleBody.length > 0 &&
+    !/decodedImage|swapSlotImage|imageReady|__low|__full|naturalWidth|\.complete|decode\(|\bimg\b/.test(settleBody),
+  `settleBody=${settleBody.length}`
+);
+ok(
+  '结算判据只有位移 / 速度 / 边界，且两个落地分支都在结算后补给资源',
+  /SWIPE_DISTANCE_RATIO/.test(settleBody) &&
+    /SWIPE_VELOCITY/.test(settleBody) &&
+    /onWheelCanStep/.test(settleBody) &&
+    (settleBody.match(/this\.o\.onWheelRest\?\.\(\);/g) || []).length === 2 &&
+    !/startFullLoad|preloadNeighbors/.test(settleBody)
+);
+ok(
+  '原图 / 邻图补给只挂在 onWheelRest 回调里，不进结算路径',
+  /onWheelRest: \(\) => \{\s*this\.startFullLoad\(\);\s*this\.preloadNeighbors\(\);\s*\}/.test(
+    viewerCode
+  ) && /onWheelCanStep: \(direction\) => \{/.test(viewerCode)
 );
 
 /* ---------------- 汇总 ---------------- */

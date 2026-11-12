@@ -9,7 +9,13 @@
  * 这里只做两件事：
  *   1. 把两类语义交给 `viewer.handleWheelPhase()`，由它转给 gestures 的
  *      `onWheelPhaseBegin()` / `onWheelPhaseEnd()`；
- *   2. 记三个极简计数，供 devtools 自证「一次手势 = 一次 begin + 一次 end」。
+ *   2. 记一份极简快照，供 devtools 自证「一次手势 = 一次 begin + 一次 end」，
+ *      并回答「这次会话到底有没有拿到原生相位」。
+ *
+ * `source` 只区分「收到过」与「一次都没收到」：后者可能是 `=0` 关掉了、
+ * 非 macOS、IPC 失败，或事件被 Rust 三重过滤挡掉。前端拿不到区分原因的
+ * 信息，**不要**把它读成「监视器未安装」的证明；65ms 兜底在两种情况下都
+ * 原样运行，快照只是让排障时不必靠猜。
  *
  * 这里**绝不**直接调用 `go()` / `settleWheelSwipe()` / `clearWheelProgress()`，
  * 也不 `preventDefault()`：翻页的方向、位移、速度、触发判定仍全部来自 Web
@@ -35,6 +41,8 @@ let sink = null;
 let totalBegins = 0;
 let totalEnds = 0;
 let lastKind = null;
+/** 最近一次合法语义到达的墙钟时间；null = 这次会话一次都没收到过 */
+let lastEventAt = null;
 
 /**
  * viewer 的相位接收端。`installWheelPhaseProbe()` 之前注册即可；非 Tauri
@@ -54,6 +62,7 @@ export async function installWheelPhaseProbe() {
     if (kind === 'begin') totalBegins += 1;
     else totalEnds += 1;
     lastKind = kind;
+    lastEventAt = Date.now();
     sink?.(kind);
   });
 }
@@ -62,7 +71,13 @@ const snapshot = () => ({
   /** 累计总数，静止时应相等（惯性未收尾时 begins 可能比 ends 多 1） */
   begins: totalBegins,
   ends: totalEnds,
-  last: lastKind
+  last: lastKind,
+  /** 'native' = 收到过相位事件；'none' = 从未收到（原因见文件头，别过度解读） */
+  source: totalBegins + totalEnds > 0 ? 'native' : 'none',
+  /** 最近一次事件的墙钟毫秒；从未收到时为 null */
+  lastEventAt,
+  /** 距最近一次事件多久（ms）；从未收到时为 null。只在取快照时算，不挂定时器 */
+  sinceLastEventMs: lastEventAt === null ? null : Math.max(0, Date.now() - lastEventAt)
 });
 
 window.__picshowWheelPhase = snapshot;

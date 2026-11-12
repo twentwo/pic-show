@@ -298,7 +298,9 @@ export class Gestures {
     window.removeEventListener('pointercancel', this._onCancel);
     window.removeEventListener('blur', this._onBlur);
     // 结算定时器也要跟着撤：它回调时会读 `this.o.track`，实例拆掉之后再跑
-    // 就是在一个已经作废的对象上动了别人的轨道
+    // 就是在一个已经作废的对象上动了别人的轨道。
+    // 这里**刻意不调** releaseWheelControl()：detach 常用于切图后重建 Gestures，
+    // `wheelSwipe` 要经 `wheelState` 交接给新实例，那是交接而不是释放。
     clearTimeout(this._wheelSettle);
     this._wheelSettle = 0;
     this.cancelAnim();
@@ -606,6 +608,10 @@ export class Gestures {
    * 永远跳过手势收敛，改窗口尺寸后图片就不再重新适配。
    */
   abort() {
+    // 失焦也是一次「交还 wheel 控制权」，且必须排在没有指针的提前返回之前：
+    // 触控板横滑时 `pointers` 本来就是空的，旧实现会直接 return，把结算定时器
+    // 和这一段的 base / settled 留在后台 —— 窗口已经不在前台却仍会翻一页。
+    this.releaseWheelControl();
     if (this.pointers.size === 0) return;
     this.resetPointerState();
     this.cancelAnim();
@@ -987,14 +993,14 @@ export class Gestures {
     }
 
     // 触控板捏合 / 旋转是 ctrl+wheel，与横滑互斥：改间距和横移是同一次
-    // 物理手势的两种解读，一次只认一种
+    // 物理手势的两种解读，一次只认一种 —— 交还控制权，别让上一段继续结算
     if (event.ctrlKey) {
-      this.resetWheelSwipe();
+      this.releaseWheelControl();
       return false;
     }
     // 右边缘属于 macOS 通知中心，那里的横向滑动两头都会响应 —— 让给系统
     if (window.innerWidth - event.clientX <= EDGE_DEADZONE_PX) {
-      this.resetWheelSwipe();
+      this.releaseWheelControl();
       return false;
     }
 
@@ -1417,6 +1423,26 @@ export class Gestures {
     clearTimeout(this._wheelSettle);
     this._wheelSettle = 0;
     this.wheelSwipe = freshWheelSwipe();
+  }
+
+  /**
+   * 显式交还 wheel 控制权：生命周期边界上撤掉还没到点的结算，并让这一段的
+   * 累积、轴向、闸门全部作废。
+   *
+   * 与 `resetWheelSwipe()` 的区别不在效果而在**契约**：后者是状态机内部的
+   * 清理（静置太久 / 新的一段），随时会被调用，不能当成「我们把 wheel 还给
+   * 系统了」的证据；前者只由下面这几处边界调用，排障时枚举这一张清单就知道
+   * 哪些情况会主动放弃一段手势：
+   *   * ctrl+wheel 捏合 / 旋转：同一次物理手势改判，不翻页；
+   *   * 右边缘 48px：让给 macOS 通知中心；
+   *   * 窗口失焦 / 切走 / 最小化（`abort()`）：结算定时器还挂着的话，窗口
+   *     已经不在前台却会翻页，回来后第一帧还会沿用旧的 base / settled。
+   *
+   * `detach()` **不**走这里：切图会重建 Gestures，这一段的轴向、视口宽与结算
+   * 闸门要经 `wheelState` 交给新实例（见 `Viewer.attachGestures`）。
+   */
+  releaseWheelControl() {
+    this.resetWheelSwipe();
   }
 
   onDoubleClick(event) {

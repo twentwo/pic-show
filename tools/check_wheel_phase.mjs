@@ -160,6 +160,14 @@ ok(
     /begins: totalBegins/.test(webCode) &&
     /ends: totalEnds/.test(webCode)
 );
+ok(
+  '能力来源可观测：source / lastEventAt / sinceLastEventMs，且不引入定时器或 IPC',
+  /source: totalBegins \+ totalEnds > 0 \? 'native' : 'none'/.test(webCode) &&
+    /lastEventAt = Date\.now\(\);/.test(webCode) &&
+    /sinceLastEventMs: lastEventAt === null \? null : Math\.max\(0, Date\.now\(\) - lastEventAt\)/.test(webCode) &&
+    !/setTimeout|setInterval/.test(webCode) &&
+    (webCode.match(/emit_to\(|listen\(/g) || []).length <= 1
+);
 
 /* ---------------- 5. 前后端接线一致 ---------------- */
 ok(
@@ -209,7 +217,9 @@ const harness = web
     'const isTauri = true; const listen = async (_n, fn) => { globalThis.__handler = fn; };')
   .replace(/^export /gm, '');
 const calls = [];
-const ctx = { window: {}, console, JSON };
+// Date / Math 显式注入：快照里的墙钟时间要能在 vm 里稳定断言，不能靠沙箱隐式
+// 内部对象碰巧存在。
+const ctx = { window: {}, console, JSON, Date, Math };
 vm.runInNewContext(harness, ctx);
 ctx.setWheelPhaseSink((kind) => calls.push(kind));
 await ctx.installWheelPhaseProbe();
@@ -236,6 +246,44 @@ ok(
     calls.length === 7,
   JSON.stringify(mid)
 );
+
+/* ---------------- 8. 行为级：能力来源可观测 ---------------- */
+// 「从未收到事件」必须能一眼看出，而不是靠 begins=0 去猜是 =0 关掉、非 macOS
+// 还是 IPC 失败。先在**没有事件**时取一次快照，再喂一帧看状态翻转。
+{
+  const fresh = web
+    .replace(/^import .*$/m,
+      'const isTauri = true; const listen = async (_n, fn) => { globalThis.__handler = fn; };')
+    .replace(/^export /gm, '');
+  const fctx = { window: {}, console, JSON, Date, Math };
+  vm.runInNewContext(fresh, fctx);
+  await fctx.installWheelPhaseProbe();
+  const before = fctx.window.__picshowWheelPhase();
+  ok(
+    '8.1 一次都没收到原生事件时 source=none，且不臆测原因',
+    before.source === 'none' && before.begins === 0 && before.ends === 0 &&
+      before.lastEventAt === null && before.sinceLastEventMs === null &&
+      before.last === null,
+    JSON.stringify(before)
+  );
+  fctx.__handler({ payload: { kind: 'begin' } });
+  const after = fctx.window.__picshowWheelPhase();
+  ok(
+    '8.2 收到首帧后 source 翻成 native，记录墙钟时间与 0ms 量级的间隔',
+    after.source === 'native' && after.begins === 1 &&
+      typeof after.lastEventAt === 'number' && after.lastEventAt > 0 &&
+      typeof after.sinceLastEventMs === 'number' && after.sinceLastEventMs >= 0,
+    JSON.stringify(after)
+  );
+  fctx.__handler({ payload: { kind: 'changed' } });
+  const dirty = fctx.window.__picshowWheelPhase();
+  ok(
+    '8.3 脏 payload 不刷新能力来源时间戳（过滤先于记账）',
+    dirty.lastEventAt === after.lastEventAt && dirty.begins === 1 &&
+      dirty.source === 'native',
+    JSON.stringify({ before: after.lastEventAt, after: dirty.lastEventAt })
+  );
+}
 
 if (problems) {
   console.error(`\n检查未通过：共 ${problems} 处问题`);

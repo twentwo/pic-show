@@ -647,7 +647,13 @@ timing 由返回值交接」。
 `tools/check_trackpad.mjs` 第 15 组与 `tools/check_wheel_phase.mjs` 钉住结构边界
 （Rust 侧归一化只发 begin / end 两类语义、每手势最多两次 emit、不直接切图、
 不吞事件、默认开启且 `=0` 可关、逐帧观测与 JSONL 全部下线）；后者还在 vm 里
-喂三段合成手势与脏 payload，验证纯转发不漏发、不双计。
+喂三段合成手势与脏 payload，验证纯转发不漏发、不双计，另用第 8 组三段
+（无事件 / 首帧 / 脏 payload）钉住能力来源快照的翻转与不误刷新。
+
+第 17 组（结构）、第 31 组（时序）与 `tools/check_preview_entry.mjs` 第 8 组
+钉住下面「已落地的启发点」小节里的三条契约：`releaseWheelControl()` 的
+三个释放点与 `detach()` 刻意不释放、失焦后不后台翻页且回来后照常切一张、
+`24 < 37 < 58 < 65` 的成对阈值关系、以及结算正文不读任何像素 / 解码节点。
 
 #### 跟手度与帧率怎么验
 
@@ -722,7 +728,7 @@ AppKit 的 213 个 `NSEvent` 则是完整的 began / changed / ended + 动量段
 | 层 | 做法 | 刻意不做 |
 | --- | --- | --- |
 | Rust `src-tauri/src/wheel_phase.rs` | 默认安装 `addLocalMonitorForEvents(.scrollWheel)`（仅 `PICSHOW_WHEEL_PHASE=0` 可关）；按「预览存在 + `viewer_listening` + 事件窗口 == keyWindow」过滤，**过滤通过后才读** `phase` / `momentumPhase`；在 Rust 侧把一次手势归一化成恰好一次 `begin` + 一次 `end`，`emit_to(AnyLabel("viewer"))` 只发这两个语义事件，payload 仅 `{ kind }` | 不吞事件（原样返回）、不改窗口装饰 / 几何、不直接切图；不再逐帧 emit、不再读 `scrollingDeltaX` / 时钟、不再写 JSONL |
-| 前端 `ui/js/wheel-phase.js` | 只 `listen` `picshow://wheel-phase`，认 `begin` / `end` 两类 `kind` 转给 `viewer.handleWheelPhase()`；保留三个累计计数供 devtools 自证 | 不调用 `go()` / `settleWheelSwipe()` / `clearWheelProgress()`，不 `preventDefault`，不挂任何额外 `wheel` 监听，不做配对 / 统计 |
+| 前端 `ui/js/wheel-phase.js` | 只 `listen` `picshow://wheel-phase`，认 `begin` / `end` 两类 `kind` 转给 `viewer.handleWheelPhase()`；保留累计计数与能力来源快照供 devtools 自证 | 不调用 `go()` / `settleWheelSwipe()` / `clearWheelProgress()`，不 `preventDefault`，不挂任何额外 `wheel` 监听或定时器，不做配对 / 统计 |
 | `Gestures` | `onWheelPhaseBegin()` 复位 `settled` / `dir` / `phaseEnded`，不受 65ms 限制；`onWheelPhaseEnd()` 置 `phaseEnded`，`armWheelSettle()` 改用 `WHEEL_PHASE_SETTLE_MS`（24ms）短刻度，等最后几个 Web wheel 落地就在**原来那条唯一结算路径**上判定切一张 / 回弹 | 不写轨道、不接管动画、不改方向映射；翻页方向、位移、速度、贴边、落位、边界回弹全部仍由 Web `wheel` 驱动 |
 
 归一化规则与原型期前端逐字一致：`phase began` 发 begin 并清惯性标志；有惯性段
@@ -735,7 +741,11 @@ ended 不再各记一次（旧原型 14 次手势记成 28 笔）。惯性标志
 的窗口判断处就返回，连相位字段都不读。归一化从前端搬到 Rust，前端只剩一个
 `listen` 回调与两个整数。逐帧诊断能力（IPC 延迟分布、配对先后、过滤帧明细）
 随原型一起下线，devtools 的 `__picshowWheelPhase()` 只返回
-`{ begins, ends, last }` —— 静止时 `begins === ends` 即说明归一化没有漏发 / 双计。
+`{ begins, ends, last, source, lastEventAt, sinceLastEventMs }` —— 静止时
+`begins === ends` 即说明归一化没有漏发 / 双计；`source` 区分「收到过原生相位」
+与「一次都没收到」，后者可能是 `=0` 关掉、非 macOS、IPC 失败或事件被三重
+过滤挡掉，前端拿不到区分原因的信息，**不要**读成「监视器未安装」的证明。
+时间戳只在取快照时算，不挂定时器、不增一次 IPC。
 
 **65ms 兜底不能因为默认开启就消失**：`PICSHOW_WHEEL_PHASE=0` / 非 macOS /
 权限缺失 / IPC 失败时整条链路零调用，`Gestures` 仍是
@@ -747,7 +757,7 @@ ended 不再各记一次（旧原型 14 次手势记成 28 笔）。惯性标志
 npm run dev                         # 默认就有原生相位
 PICSHOW_WHEEL_PHASE=0 npm run dev   # 对照：纯 65ms 静默兜底
 # 预览里双指横滑几次（含一次相隔约 50ms 的快滑），devtools 执行：
-__picshowWheelPhase()               # { begins, ends, last }
+__picshowWheelPhase()               # { begins, ends, last, source, ... }
 ```
 
 两种启动各做一次同样的快滑，人工确认：默认启动时索引各切一张、松手后立刻
@@ -757,6 +767,25 @@ __picshowWheelPhase()               # { begins, ends, last }
 确认索引各切一张）；② 逐帧惯性手感与观感仍需人工验收；③ `momentum cancelled`
 在三轮真机样本里一次都没出现，代码按同一路径处理但不据此假报已验证；
 ④ 默认开启后的**长期运行**开销未测（原型期只跑了短样本，`=0` 是逃生开关）。
+
+#### 从候选库提炼的启发点：哪些已落进代码
+
+此前评估过 Embla + Wheel Gestures、Swiper `mousewheel`、Splide、PhotoSwipe、
+Keen Slider、Glide.js 六个候选，结论是**不引入任何依赖**（`package.json` 运行时
+依赖为空）。它们只在思路层给了启发，本轮把其中尚未落地的四条补进代码；
+其余条目本来就已实现或已被检查器钉住，不重复造轮子。
+
+| 启发（来源） | 代码落点 | 具体做了什么 |
+| --- | --- | --- |
+| 能力缺口要**显式声明**而非静默降级（Keen / Glide 的「wheel 需额外插件」） | `ui/js/wheel-phase.js` | 快照新增 `source` / `lastEventAt` / `sinceLastEventMs`。纯观测：不增 IPC、不挂 `wheel` 监听、不设定时器；65ms 兜底在 `source=none` 时原样运行 |
+| 显式的「交还 wheel 控制权」入口（Swiper `releaseOnEdges` / Splide `releaseWheel`） | `ui/js/gestures.js::releaseWheelControl()` | 把三处释放点收成一张可枚举清单：`ctrl+wheel` 改判、右边缘让给通知中心、窗口失焦 `abort()`。其中失焦是**真修复**：旧 `abort()` 在没有指针时提前返回，结算定时器挂在后台到点仍会翻一页、回来后还沿用旧 `base` / `settled`。`detach()` 刻意不释放 —— 切图要经 `wheelState` 交接，那是交接不是释放 |
+| 时间阈值与位移阈值是**成对旋钮**（Swiper `thresholdDelta` / `thresholdTime`） | `tools/check_wheel_swipe.mjs` 第 31 组 | 从 `gestures.js` 解析 65 / 24 / 60，与真机基线「段内 ≤37ms、连滑 58ms」一起断言 `24 < 37 < 58 < 65`，并要求 65ms 同时用于「新的一段」与「兜底结算」。调任一个刻度都会立刻被这条关系拦住 |
+| 资源就绪状态与结算**解耦**（PhotoSwipe 把尺寸当必需输入） | `tools/check_preview_entry.mjs` 第 8 组 | 钉住「`settleWheelSwipe()` 正文不读任何像素 / 解码 / 图片节点」「原图与邻图补给只挂在结算后的 `onWheelRest`」。慢盘 / 大图下切换准确性因此不受加载影响 |
+
+**刻意没做**：边界处把 wheel 控制权真正交还系统（会与「只弹当前图、不露
+边缘」的既有契约冲突，必须真机 A/B 才敢动）；输入适配层拆分、十余个手感
+常量收成单一配置面（抽象收益低且要动已稳定的多入口路径）；路由矩阵 / 反模式
+清单文档化（纯文档性）。这些都不改运行时行为，本轮不为「补齐清单」而改代码。
 
 ## 六、架构要点
 

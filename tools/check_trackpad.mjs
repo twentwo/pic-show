@@ -511,13 +511,13 @@ ok(
 /* ---------------- 8. 冲突规避必须在位 ---------------- */
 
 ok(
-  '捏合（ctrl+wheel）与横滑互斥',
-  /if \(event\.ctrlKey\) \{\s*this\.resetWheelSwipe\(\);\s*return false;/.test(gestures)
+  '捏合（ctrl+wheel）与横滑互斥，并走显式释放入口',
+  /if \(event\.ctrlKey\) \{\s*this\.releaseWheelControl\(\);\s*return false;/.test(gestures)
 );
 
 ok(
-  '右边缘让给 macOS 通知中心',
-  /if \(window\.innerWidth - event\.clientX <= EDGE_DEADZONE_PX\)/.test(gestures)
+  '右边缘让给 macOS 通知中心，并走同一个显式释放入口',
+  /if \(window\.innerWidth - event\.clientX <= EDGE_DEADZONE_PX\)\s*\{\s*this\.releaseWheelControl\(\);\s*return false;/.test(gesturesCode)
 );
 
 ok(
@@ -1082,6 +1082,38 @@ ok(
   '阴影层不碰切换语义：不调 go / settleWheelSwipe / fill / onWheelSwipe',
   shadeMethods.length > 0 &&
     !/onWheelSwipe|settleWheelSwipe|this\.go\(|this\.fill\(/.test(shadeMethods)
+);
+
+/* ---------------- 17. 控制权显式释放契约 ---------------- */
+// Swiper `releaseOnEdges` / Splide `releaseWheel` 给的是「何时把 wheel 交还」
+// 的显式入口。这里落成一个**命名**的生命周期方法，并把所有释放点收在一张
+// 可枚举的清单里；语义仍等价于原来的 resetWheelSwipe，不碰边界回弹行为。
+
+const releaseDef = /releaseWheelControl\(\) \{\s*this\.resetWheelSwipe\(\);\s*\}/.test(gesturesCode);
+ok(
+  'releaseWheelControl 是唯一命名的释放入口，且只委托给 resetWheelSwipe',
+  releaseDef && (gesturesCode.match(/releaseWheelControl\(\);/g) || []).length === 3,
+  `hits=${(gesturesCode.match(/releaseWheelControl\(\);/g) || []).length}`
+);
+const abortBody = gesturesCode.slice(
+  gesturesCode.indexOf('abort() {'),
+  gesturesCode.indexOf('resetPointerState() {')
+);
+ok(
+  '失焦 abort 在「没有指针就提前返回」之前释放（不在后台翻页 / 不留残留状态）',
+  /this\.releaseWheelControl\(\);[\s\S]{0,80}?if \(this\.pointers\.size === 0\) return;/.test(abortBody),
+  `abortBody=${abortBody.length}`
+);
+const detachBody = gesturesCode.slice(
+  gesturesCode.indexOf('detach() {'),
+  gesturesCode.indexOf('get isZoomed()')
+);
+ok(
+  'detach 刻意不释放：wheelState 要交接给切图后的新 Gestures 实例',
+  detachBody.length > 0 &&
+    !/releaseWheelControl/.test(detachBody) &&
+    /clearTimeout\(this\._wheelSettle\)/.test(detachBody) &&
+    /wheelState: previous\?\.wheelSwipe,/.test(viewerCode)
 );
 
 /* ---------------- 汇总 ---------------- */

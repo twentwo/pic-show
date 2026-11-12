@@ -99,6 +99,17 @@ macOS 无公开 API 指定第 N 个桌面（`CGS*` 私有，产品代码不用�
   用户对比两种启动方式确认：带相位时快滑更流畅（松手→落位提前 24~41ms、
   50~58ms 连滑不再被吞）。**默认开启后的长期运行开销、真机逐帧手感 /
   `momentum cancelled` 仍未验证**，别假报成功。
+- **能力来源与释放契约（2026-11-10 补，别回退）**：`wheel-phase.js` 快照除
+  `begins/ends/last` 还有 `source('native'|'none')` / `lastEventAt` /
+  `sinceLastEventMs`；`source=none` 只说明**从未收到**，成因可能是 `=0` / 非
+  macOS / IPC 失败 / 三重过滤，别读成「监视器未安装」。零新增 IPC、wheel
+  监听或定时器。`gestures.js::releaseWheelControl()` 是唯一命名的生命周期
+  释放口，只委托 `resetWheelSwipe()`，恰好 3 个调用点：`ctrl+wheel`、右边缘
+  48px、`abort()`（失焦）。**`abort()` 的释放必须排在 `pointers.size===0`
+  提前返回之前** —— 横滑没有指针，旧实现会留着结算定时器在后台翻页。
+  **`detach()` 刻意不释放**：切图要经 `wheelState` 把状态交给新 Gestures。
+  边界真正把 wheel 交还系统仍**未做**（与「只弹当前图、不露边缘」冲突，
+  须真机 A/B）。第 31 组钉 `24 < 37 < 58 < 65`，改任一时间刻度先跑它。
 
 ## 动画与像素（别回退）
 
@@ -146,11 +157,12 @@ macOS 无公开 API 指定第 N 个桌面（`CGS*` 私有，产品代码不用�
 
 ## 回归纪律
 
-语义改动必须同批同步：`tools/check_wheel_swipe.mjs`（时序，含 22/24/27/28/29 组，
-29 = 原生相位结算与兜底）、`tools/check_trackpad.mjs`（结构 + 旧锁定不得回归 +
-7a2 边界 + 11~16 组动画/像素/相位/边界阴影）、`tools/check_wheel_phase.mjs`（产品链路边界 + vm 行为级）、
+语义改动必须同批同步：`tools/check_wheel_swipe.mjs`（时序，含 22/24/27/28/29/30/31 组，
+29 = 原生相位结算与兜底、30 = 慢滑回弹曲线、31 = 成对阈值与失焦释放）、
+`tools/check_trackpad.mjs`（结构 + 旧锁定不得回归 +
+7a2 边界 + 11~17 组动画/像素/相位/边界阴影/释放契约）、`tools/check_wheel_phase.mjs`（产品链路边界 + vm 行为级，第 8 组 = 能力来源快照）、
 `tools/check_preview_entry.mjs` 第 7 组（预览显示：淡入提交纪律 / fill 可见性兜底顺序 /
-同索引换集合重画 / 开场不写 inline 0 / 关闭置 0 仍在）、
+同索引换集合重画 / 开场不写 inline 0 / 关闭置 0 仍在）与第 8 组（资源就绪与结算解耦）、
 `ui/probe.html` 第 17 节（`17.2` 一次一张、`17.8`/`17.19` 边界、`17.17` 贴边、
 `17.18` 落位速度、`17.20` 相位转发、`17.21` 慢滑复位、`17.22` 边界阴影）与
 第 21 节（`21.1~9`：把 `img://` 换成可加载 SVG，逐步量当前槽画的是不是目标图、
